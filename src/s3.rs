@@ -1,14 +1,14 @@
 use std::io::{Result, Error, ErrorKind};
 use std::collections::BTreeSet;
 use aws_sdk_s3::Client;
-use log::error;
+use log::{debug, error};
 use btree_ondisk::bmap::BMap;
 use btree_ondisk::BlockLoader;
 use hyperfile::{BlockIndex, BlockPtr, SegmentId};
 use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::ondisk::InodeRaw;
 use hyperfile::inode::{Inode, OnDiskState};
-use hyperfile::segment::{SegmentSum, SegmentReadWrite};
+use hyperfile::segment::{Segment, SegmentSum, SegmentReadWrite};
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging};
 use hyperfile::config::HyperFileRuntimeConfig;
 use hyperfile::s3uri::S3Uri;
@@ -118,6 +118,12 @@ impl S3Cleaner {
             high
         };
 
+        debug!("collect unreferenced segment low: {}, high: {}", low, high_segid);
+        if low >= high_segid {
+            let err_msg = format!("invalid segment range [{}, {}]", low, high_segid);
+            return Err(Error::new(ErrorKind::InvalidInput, err_msg));
+        }
+
         // load segment sum
         let ss = self.load_segment_sum(high_segid).await?;
         let i_bmap = ss.hdr.s_inode.i_bmap;
@@ -144,12 +150,17 @@ impl S3Cleaner {
 }
 
 impl Cleaner for S3Cleaner {
+    async fn collect(&self, low: SegmentId, high: SegmentId) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+        self.collect_unref_seg(low, high).await
+    }
+
     // prune unreferenced segments between low and high
     async fn prune(&self, low: SegmentId, high: SegmentId) -> Result<()> {
         let (_, non_ref) = self.collect_unref_seg(low, high).await?;
         let delete_keys = non_ref.iter().map(|segid| {
-                                format!("{}/{}", self.root_path, segid)
+                                format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(*segid))
                             }).collect::<Vec<String>>();
+        debug!("unrefereneced segments to delete {:?}", delete_keys);
         Self::do_delete_objects(&self.client, &self.bucket, delete_keys).await?;
         Ok(())
     }
