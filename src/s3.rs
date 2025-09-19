@@ -4,6 +4,7 @@ use aws_sdk_s3::Client;
 use log::{debug, error};
 use btree_ondisk::bmap::BMap;
 use btree_ondisk::BlockLoader;
+use btree_ondisk::NullNodeCache;
 use hyperfile::{BlockIndex, BlockPtr, SegmentId};
 use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::ondisk::InodeRaw;
@@ -53,7 +54,7 @@ impl S3Cleaner {
         Ok((raw_inode, inode_state))
     }
 
-	fn collect_segment_id<'a, L>(bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L>) -> BTreeSet<u64>
+	fn collect_segment_id<'a, L>(bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>) -> BTreeSet<u64>
     	where L: BlockLoader<BlockPtr> + Clone,
 	{
     	// collect segment id in u64
@@ -132,7 +133,7 @@ impl S3Cleaner {
         // build bmap
         let loader = S3BlockLoader::new(&self.client, &self.bucket, &self.root_path);
         let set = tokio::task::spawn_blocking(move || {
-            let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader>::read(&i_bmap, meta_block_size, loader);
+            let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>::read(&i_bmap, meta_block_size, loader, NullNodeCache);
             Self::collect_segment_id(bmap)
         }).await.expect("spawn blocking task failed");
 
