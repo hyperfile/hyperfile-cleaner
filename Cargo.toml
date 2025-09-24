@@ -1,7 +1,14 @@
 [package]
-name = "hyperfile-cleaner-staging"
+name = "hyperfile-cleaner"
 version = "0.1.0"
 edition = "2024"
+description = "Segments cleaner implementation for Hyperfile"
+authors = ["Dai Yiyang"]
+license = "Apache-2.0"
+categories = ["asynchronous", "filesystem", "data-structures"]
+keywords = ["file", "object-storage", "s3"]
+homepage = "https://github.com/hyperfile/hyperfile-cleaner"
+repository = "https://github.com/hyperfile/hyperfile-cleaner"
 
 [dependencies]
 log = "0.4.27"
