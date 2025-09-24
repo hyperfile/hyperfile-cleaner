@@ -8,5 +8,5 @@ log = "0.4.27"
 tokio = { version = "1", features = ["full"] }
 aws-config = { version = "1.8.1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.96.0"
-btree-ondisk = { version = "0.15.0", path = "../btree-ondisk", default-features = false, features = ["rc", "tokio-runtime"] }
-hyperfile = { version = "0.1.0", path = "../hyperfile-staging", default-features = false }
+btree-ondisk = { version = "0.16.0", default-features = false, features = ["rc", "tokio-runtime"] }
+hyperfile = { version = "0.2.0", default-features = false }
