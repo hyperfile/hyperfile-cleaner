@@ -1,6 +1,6 @@
 # Hyperfile Cleaner
 
-Segment cleaner implementation for Hyperfile.
+Segments cleaner implementation for Hyperfile.
 
 Current only support `prune` unreferenced segments.
 
