@@ -1,3 +1,11 @@
+//! S3-backed cleaner implementation.
+//!
+//! `S3Cleaner` enumerates the segments referenced by the latest
+//! published inode of a hyperfile and (optionally) deletes anything
+//! in a configured `[low, high]` segid range that isn't referenced.
+//!
+//! See the crate-level [`Cleaner`] trait for the public API shape.
+
 use std::io::{Result, Error, ErrorKind};
 use std::collections::BTreeSet;
 use aws_sdk_s3::Client;
@@ -16,6 +24,20 @@ use hyperfile::s3uri::S3Uri;
 use hyperfile::meta_format::BlockPtrFormat;
 use crate::Cleaner;
 
+/// S3-backed cleaner for a single hyperfile rooted at a given
+/// `s3://<bucket>/<prefix>` URI.
+///
+/// The cleaner does not retain or open the file's data. It only
+/// reads the published inode and walks the metadata B+tree to
+/// enumerate referenced segments, then deletes the unreferenced
+/// ones via `DeleteObjects`.
+///
+/// Concurrency: the cleaner is not aware of in-flight writers. If
+/// a writer publishes a new checkpoint while `collect` /
+/// `prune` is running, the result reflects whatever inode was
+/// loaded at the start of the call. New segments published after
+/// that point are outside the configured `[low, high]` range and
+/// are not affected.
 pub struct S3Cleaner {
     client: Client,
     bucket: String,
@@ -24,23 +46,39 @@ pub struct S3Cleaner {
 }
 
 impl S3Cleaner {
+    /// Construct a cleaner for `root_uri`, using the AWS SDK's
+    /// default credential / region resolution
+    /// (`aws_config::load_from_env`).
+    ///
+    /// Returns `InvalidInput` if `root_uri` is not a valid S3 URI.
     pub async fn new(root_uri: &str) -> Result<Self> {
-        let root_uri = if let Some(remove_tail_slash) = root_uri.strip_suffix('/') {
-            remove_tail_slash
-        } else {
-            root_uri
-        };
-        let s3uri = S3Uri::parse(root_uri).expect("failed to parse root path for s3");
-        let config = aws_config::load_from_env().await;
-        let client = aws_sdk_s3::Client::new(&config);
+        let cfg = aws_config::load_from_env().await;
+        let client = Client::new(&cfg);
+        Self::with_client(&client, root_uri).await
+    }
+
+    /// Construct a cleaner using a caller-supplied `Client`. Use
+    /// this when you need to control region / endpoint / credential
+    /// resolution explicitly (for example, in tests or in a tool
+    /// that already has a configured client).
+    ///
+    /// Returns `InvalidInput` if `root_uri` is not a valid S3 URI.
+    pub async fn with_client(client: &Client, root_uri: &str) -> Result<Self> {
+        let trimmed = root_uri.strip_suffix('/').unwrap_or(root_uri);
+        let s3uri = S3Uri::parse(trimmed).map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid S3 URI {:?}: {}", root_uri, e),
+            )
+        })?;
         let runtime_config = HyperFileRuntimeConfig::default();
         let staging_config = StagingConfig::new_s3_staging(s3uri.bucket, "", s3uri.key, None);
-        let staging = S3Staging::from(&client, staging_config, runtime_config).await?;
+        let staging = S3Staging::from(client, staging_config, runtime_config).await?;
         Ok(Self {
-            client: client,
+            client: client.clone(),
             bucket: s3uri.bucket.to_owned(),
             root_path: s3uri.key.to_owned(),
-            staging: staging,
+            staging,
         })
     }
 
@@ -49,43 +87,62 @@ impl S3Cleaner {
     }
 
     async fn load_raw_inode(&self) -> Result<(InodeRaw, Option<OnDiskState>)> {
-        let mut raw_inode: InodeRaw = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        let mut raw_inode = InodeRaw::default();
         let inode_state = self.staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
         Ok((raw_inode, inode_state))
     }
 
-	fn collect_segment_id<'a, L>(bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>) -> BTreeSet<u64>
-    	where L: BlockLoader<BlockPtr> + Clone,
-	{
-    	// collect segment id in u64
-    	let mut segid_set: BTreeSet<u64> = BTreeSet::new();
+    /// Walk the B+tree starting from the supplied `bmap` root and
+    /// collect the set of segment IDs that hold any of its
+    /// non-leaf-node-stored block pointers. In hyperfile's CoW
+    /// model this set is sufficient to identify all segments that
+    /// must be retained.
+    fn collect_segment_id<'a, L>(
+        bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
+    ) -> BTreeSet<SegmentId>
+    where
+        L: BlockLoader<BlockPtr> + Clone,
+    {
+        let mut segid_set: BTreeSet<SegmentId> = BTreeSet::new();
+        for blkptr in bmap.nonleafnode_iter() {
+            if BlockPtrFormat::is_on_staging(&blkptr) {
+                segid_set.insert(BlockPtrFormat::decode_segid(&blkptr));
+            }
+        }
+        segid_set
+    }
 
-    	let iter = bmap.nonleafnode_iter();
-    	for blkptr in iter {
-    	    if BlockPtrFormat::is_on_staging(&blkptr) {
-    	        let segid = BlockPtrFormat::decode_segid(&blkptr);
-    	        segid_set.insert(segid);
-    	    }
-    	}
-		segid_set
-	}
-
-    async fn do_delete_objects(client: &Client, bucket: &str, delete_keys: Vec<String>) -> Result<()> {
+    /// Delete `delete_keys` from `bucket` in batches of 1000 (the
+    /// `DeleteObjects` per-call max).
+    ///
+    /// On per-batch failure the SDK error is logged at `error!`
+    /// level. The function returns `Err(Interrupted)` if any batch
+    /// failed; the error message lists the failed batch keys so the
+    /// caller can re-run on a narrower range or investigate.
+    async fn do_delete_objects(
+        client: &Client,
+        bucket: &str,
+        delete_keys: Vec<String>,
+    ) -> Result<()> {
         use aws_sdk_s3::types::ObjectIdentifier;
-        let mut err = false;
-        for keys in delete_keys.chunks(1000).into_iter() {
-            let obj_ids = keys.into_iter().map(|k| {
-                    // FIXME: move the value, avoid ref
+        if delete_keys.is_empty() {
+            return Ok(());
+        }
+        let mut failed_keys: Vec<String> = Vec::new();
+        for keys in delete_keys.chunks(1000) {
+            let obj_ids = keys.iter()
+                .map(|k| {
                     ObjectIdentifier::builder()
-                        .key(k.to_string())
+                        .key(k)
                         .build()
-                        .unwrap()
-                }).collect::<Vec<ObjectIdentifier>>();
+                        .expect("ObjectIdentifier requires non-empty key")
+                })
+                .collect::<Vec<ObjectIdentifier>>();
             let delete = aws_sdk_s3::types::Delete::builder()
-                    .set_objects(Some(obj_ids))
-                    .quiet(true)
-                    .build()
-                    .unwrap();
+                .set_objects(Some(obj_ids))
+                .quiet(true)
+                .build()
+                .expect("Delete::builder requires non-empty object list");
             match client.delete_objects()
                 .bucket(bucket)
                 .delete(delete)
@@ -94,24 +151,42 @@ impl S3Cleaner {
             {
                 Ok(_) => {},
                 Err(sdk_err) => {
-                    err = true;
-                    // TODO: check delete objects result with signle delete error
-                    error!("delete objects error: {}", sdk_err);
+                    error!("DeleteObjects batch failed (bucket={}, count={}): {}",
+                        bucket, keys.len(), sdk_err);
+                    failed_keys.extend(keys.iter().cloned());
                 }
             }
         }
-        if err {
-            return Err(Error::new(ErrorKind::Interrupted, "at least one of delete objects op failed"));
+        if failed_keys.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorKind::Interrupted,
+                format!(
+                    "DeleteObjects failed for {} object(s); first failed key: {:?}",
+                    failed_keys.len(),
+                    failed_keys.first(),
+                ),
+            ))
         }
-        Ok(())
     }
 
-    // collect referenced and unreferenced segment between low and high
-    // return:
-    //   (referenced seg list, unreferenced seg list)
-    async fn collect_unref_seg(&self, low: SegmentId, high: SegmentId) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+    /// Inner shared implementation used by both `collect` and
+    /// `prune`. Returns `(referenced, unreferenced)` segment id
+    /// vectors where:
+    ///  - `referenced` is the set of segids reachable via the
+    ///    latest published inode's metadata tree, intersected with
+    ///    `[low, high]`.
+    ///  - `unreferenced` is `[low, high]` minus the referenced set.
+    ///
+    /// `high == 0` is a sentinel meaning "use the latest checkpoint
+    /// (`inode.get_last_seq()`)".
+    async fn collect_unref_seg(
+        &self,
+        low: SegmentId,
+        high: SegmentId,
+    ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
         let high_segid = if high == 0 {
-            // load last inode from disk
             let (raw_inode, inode_state) = self.load_raw_inode().await?;
             let inode = Inode::from_raw(&raw_inode, inode_state);
             inode.get_last_seq()
@@ -125,44 +200,81 @@ impl S3Cleaner {
             return Err(Error::new(ErrorKind::InvalidInput, err_msg));
         }
 
-        // load segment sum
+        // load segment summary for the high checkpoint
         let ss = self.load_segment_sum(high_segid).await?;
         let i_bmap = ss.hdr.s_inode.i_bmap;
         let meta_block_size = 1 << ss.hdr.s_meta_blk_shift;
 
-        // build bmap
+        // Walk the B+tree on a blocking thread (btree-ondisk's
+        // sync API parks on the runtime; we don't want to park
+        // the caller's reactor thread).
         let loader = S3BlockLoader::new(&self.client, &self.bucket, &self.root_path);
-        let set = tokio::task::spawn_blocking(move || {
-            let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>::read(&i_bmap, meta_block_size, loader, NullNodeCache);
-            Self::collect_segment_id(bmap)
-        }).await.expect("spawn blocking task failed");
+        let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
+            let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
+                ::read(&i_bmap, meta_block_size, loader, NullNodeCache)?;
+            Ok(Self::collect_segment_id(bmap))
+        });
+        let set = match join.await {
+            Ok(inner) => inner?,
+            Err(join_err) => {
+                return Err(Error::new(
+                    ErrorKind::Other,
+                    format!("bmap walk task failed to join: {}", join_err),
+                ));
+            }
+        };
 
-        let high = high_segid;
-        // build non-referenced list
+        // Build the unreferenced list within [low, high].
         let mut non_ref = Vec::new();
-        for n in low..=high {
-            if set.get(&n).is_none() {
+        for n in low..=high_segid {
+            if !set.contains(&n) {
                 non_ref.push(n);
             }
         }
-        let v_ref = set.into_iter().map(|segid| segid).collect::<Vec<SegmentId>>();
+        let v_ref = set.into_iter().collect::<Vec<SegmentId>>();
         Ok((v_ref, non_ref))
     }
 }
 
 impl Cleaner for S3Cleaner {
-    async fn collect(&self, low: SegmentId, high: SegmentId) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+    async fn collect(
+        &self,
+        low: SegmentId,
+        high: SegmentId,
+    ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
         self.collect_unref_seg(low, high).await
     }
 
-    // prune unreferenced segments between low and high
+    /// Prune unreferenced segments in `[low, high]`. Implemented
+    /// as `collect` followed by `DeleteObjects` of the
+    /// unreferenced list.
     async fn prune(&self, low: SegmentId, high: SegmentId) -> Result<()> {
         let (_, non_ref) = self.collect_unref_seg(low, high).await?;
-        let delete_keys = non_ref.iter().map(|segid| {
-                                format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(*segid))
-                            }).collect::<Vec<String>>();
-        debug!("unrefereneced segments to delete {:?}", delete_keys);
-        Self::do_delete_objects(&self.client, &self.bucket, delete_keys).await?;
-        Ok(())
+        let delete_keys = non_ref.iter()
+            .map(|segid| format!(
+                "{}/{}",
+                self.root_path,
+                Segment::segid_to_staging_file_id(*segid),
+            ))
+            .collect::<Vec<String>>();
+        debug!("unreferenced segments to delete: {:?}", delete_keys);
+        Self::do_delete_objects(&self.client, &self.bucket, delete_keys).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builder calls in `do_delete_objects` panic only on empty
+    /// inputs that we guard against. Verify the empty-input fast
+    /// path.
+    #[tokio::test]
+    async fn delete_empty_keys_is_noop() {
+        let cfg = aws_config::load_from_env().await;
+        let client = Client::new(&cfg);
+        // Empty list -> no SDK call -> Ok regardless of credentials.
+        let r = S3Cleaner::do_delete_objects(&client, "any-bucket", Vec::new()).await;
+        assert!(r.is_ok(), "empty key list should not call S3");
     }
 }

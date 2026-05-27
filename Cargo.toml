@@ -12,8 +12,12 @@ repository = "https://github.com/hyperfile/hyperfile-cleaner"
 
 [dependencies]
 log = "0.4.27"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 aws-config = { version = "1.8.1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.96.0"
-btree-ondisk = { version = "0.16.0", default-features = false, features = ["rc", "tokio-runtime"] }
-hyperfile = { version = "0.2.0", default-features = false }
+btree-ondisk = { version = "0.18", default-features = false, features = ["rc", "tokio-runtime"] }
+hyperfile = { version = "0.3", default-features = false, features = ["blocking"] }
+
+[dev-dependencies]
+env_logger = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }

@@ -1,17 +1,63 @@
 # Hyperfile Cleaner
 
-Segments cleaner implementation for Hyperfile.
+Segments cleaner for [Hyperfile](https://crates.io/crates/hyperfile).
 
-Current only support `prune` unreferenced segments.
+## What it does
 
-## Under Developement
+Hyperfile is a copy-on-write log-structured file format on S3. Each
+flush produces a new segment object. Over time, older segments lose
+references as the metadata tree gets rewritten. This crate
+enumerates and (optionally) deletes segments that are no longer
+referenced by the latest published checkpoint.
 
-:warning: This library is currently under developement and is **NOT** recommended for production.
+Two operations on the [`Cleaner`] trait:
+
+- **`collect(low, high)`** — dry-run inspection. Walks the metadata
+  tree, returns `(referenced, unreferenced)` segment id lists.
+- **`prune(low, high)`** — `collect` + delete the unreferenced list
+  via S3 `DeleteObjects`.
+
+`high == 0` is a sentinel for "use the latest checkpoint". `low` is
+inclusive.
+
+## Usage
+
+```rust,no_run
+use hyperfile_cleaner::{Cleaner, s3::S3Cleaner};
+
+# async fn run() -> std::io::Result<()> {
+let cleaner = S3Cleaner::new("s3://my-bucket/path/to/file").await?;
+
+// Dry-run: see what would be deleted.
+let (refed, unrefed) = cleaner.collect(1, 0).await?;
+println!("referenced segments  : {:?}", refed);
+println!("unreferenced segments: {:?}", unrefed);
+
+// Actually delete.
+cleaner.prune(1, 0).await?;
+# Ok(())
+# }
+```
+
+For tools that already have a configured `aws_sdk_s3::Client`, use
+`S3Cleaner::with_client(&client, root_uri)` instead of `new`.
+
+## Limitations
+
+- The cleaner does not coordinate with in-flight writers. It
+  snapshots the inode at the start of the call. New segments
+  published after that point are outside the configured range and
+  remain untouched.
+- Compaction (rewriting partially-live segments) is not supported.
+
+## Status
+
+> :warning: Under development. Not recommended for production.
 
 ## License
 
-This project is licensed under the Apache-2.0 License.
+Apache-2.0.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+PRs welcome.
