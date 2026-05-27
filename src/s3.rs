@@ -115,10 +115,22 @@ impl S3Cleaner {
     /// Delete `delete_keys` from `bucket` in batches of 1000 (the
     /// `DeleteObjects` per-call max).
     ///
-    /// On per-batch failure the SDK error is logged at `error!`
-    /// level. The function returns `Err(Interrupted)` if any batch
-    /// failed; the error message lists the failed batch keys so the
-    /// caller can re-run on a narrower range or investigate.
+    /// Failures are tracked at two levels and merged into the same
+    /// returned error:
+    ///
+    /// 1. **SDK-level (transport / auth / etc.)**: the entire batch
+    ///    is recorded as failed. The SDK error is logged at
+    ///    `error!` level.
+    /// 2. **Per-key (S3 partial success in `DeleteObjectsOutput`)**:
+    ///    `DeleteObjects` is a partial-success API; even when the
+    ///    batch returns `Ok`, individual keys may have failed (e.g.
+    ///    `AccessDenied`, `NoSuchKey`). The response's `errors`
+    ///    list is parsed and each failing key recorded.
+    ///
+    /// Returns `Err(Interrupted)` if any key (at either level)
+    /// failed. The error message includes the failed object count
+    /// and a sample failed key. Successfully-deleted keys stay
+    /// deleted (S3 has no transactional batch delete).
     async fn do_delete_objects(
         client: &Client,
         bucket: &str,
@@ -138,6 +150,9 @@ impl S3Cleaner {
                         .expect("ObjectIdentifier requires non-empty key")
                 })
                 .collect::<Vec<ObjectIdentifier>>();
+            // We use quiet=true so the response only carries the
+            // `errors` list (not the success list); this is what
+            // we want for partial-failure tracking.
             let delete = aws_sdk_s3::types::Delete::builder()
                 .set_objects(Some(obj_ids))
                 .quiet(true)
@@ -149,8 +164,27 @@ impl S3Cleaner {
                 .send()
                 .await
             {
-                Ok(_) => {},
+                Ok(output) => {
+                    // Partial-success path: even though the batch
+                    // returned Ok at the SDK level, individual keys
+                    // may have failed. Pick those out of the
+                    // response.
+                    if let Some(errors) = output.errors {
+                        for e in errors {
+                            let key = e.key.unwrap_or_default();
+                            let code = e.code.as_deref().unwrap_or("?");
+                            let msg = e.message.as_deref().unwrap_or("");
+                            error!("DeleteObjects per-key failure: key={} code={} message={}",
+                                key, code, msg);
+                            if !key.is_empty() {
+                                failed_keys.push(key);
+                            }
+                        }
+                    }
+                },
                 Err(sdk_err) => {
+                    // SDK-level failure: treat the whole batch as
+                    // failed (we don't know which keys made it).
                     error!("DeleteObjects batch failed (bucket={}, count={}): {}",
                         bucket, keys.len(), sdk_err);
                     failed_keys.extend(keys.iter().cloned());
