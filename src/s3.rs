@@ -88,7 +88,7 @@ impl S3Cleaner {
 
     async fn load_raw_inode(&self) -> Result<(InodeRaw, Option<OnDiskState>)> {
         let mut raw_inode = InodeRaw::default();
-        let inode_state = self.staging.load_inode(&mut raw_inode.as_mut_u8_slice()).await?;
+        let inode_state = self.staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
         Ok((raw_inode, inode_state))
     }
 
@@ -251,8 +251,7 @@ impl S3Cleaner {
         let set = match join.await {
             Ok(inner) => inner?,
             Err(join_err) => {
-                return Err(Error::new(
-                    ErrorKind::Other,
+                return Err(Error::other(
                     format!("bmap walk task failed to join: {}", join_err),
                 ));
             }
