@@ -8,12 +8,14 @@
 
 use std::io::{Result, Error, ErrorKind};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use aws_sdk_s3::Client;
 use log::{debug, error};
 use btree_ondisk::bmap::BMap;
 use btree_ondisk::BlockLoader;
 use btree_ondisk::NullNodeCache;
 use hyperfile::{BlockIndex, BlockPtr, SegmentId};
+use hyperfile::file::ReadTiming;
 use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::ondisk::InodeRaw;
 use hyperfile::inode::{Inode, OnDiskState};
@@ -242,7 +244,13 @@ impl S3Cleaner {
         // Walk the B+tree on a blocking thread (btree-ondisk's
         // sync API parks on the runtime; we don't want to park
         // the caller's reactor thread).
-        let loader = S3BlockLoader::new(&self.client, &self.bucket, &self.root_path);
+        // Counters are per-loader and the cleaner has nowhere to report
+        // them, so give this walk its own throwaway ReadTiming rather
+        // than threading one through the public API.
+        let loader = S3BlockLoader::new(
+            &self.client, &self.bucket, &self.root_path,
+            Arc::new(ReadTiming::default()),
+        );
         let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
             let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
                 ::read(&i_bmap, meta_block_size, loader, NullNodeCache)?;
