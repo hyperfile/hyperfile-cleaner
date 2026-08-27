@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - 2026-08-27
 
-A dependency release: the crate's own API is unchanged, but it can now only read
-containers written by `hyperfile 0.4.0` or later, which is why this is a minor
-bump rather than a patch.
+Raises the `hyperfile` floor past an on-disk layout change, and fixes a
+data-loss defect in `prune`: for any file small enough to keep a direct bmap, it
+deleted the segments holding that file's only live data. The public API is
+unchanged.
 
 ### Breaking changes
 
@@ -34,6 +35,33 @@ bump rather than a patch.
   migration for a container written by a `0.3.x`-based tool.
 
 ### Fixed
+
+- **`prune` deleted the live data of any file small enough to keep a direct
+  bmap.** `collect_segment_id` derived the referenced set purely from
+  `BMap::nonleafnode_iter`, which walks intermediate nodes. A direct bmap has
+  none — the root, which lives inside the inode, holds the data block pointers
+  itself — so the iterator correctly yielded nothing and the referenced set came
+  back *empty*. Every segment was then reported unreferenced, including the ones
+  holding the file's only live blocks.
+
+  Confirmed against real S3 before the fix: a two-block file reported
+  `0 / 2 segments` reachable, `prune` deleted both segments, and reads came back
+  `NoSuchKey`. After the fix the same file reports `2 / 2` reachable and `prune`
+  is a no-op, while a subsequent overwrite of both blocks correctly leaves the
+  two superseded segments reclaimable and prunes exactly those.
+
+  The direct case is now walked by key (`seek_key` / `lookup`), bounded by the
+  root's slot count. `collect_segment_id` returns `Result` accordingly.
+
+- **`collect` and `prune` rejected a file with a single checkpoint.** The segid
+  range is documented as inclusive at both ends, and `collect(1, 0)` — the form
+  this crate's own documentation gives as the typical call — resolves `high` to
+  `get_last_seq()`, so it lands on `low == high` for a file flushed once. The
+  guard was `low >= high_segid`, which turned that into
+  `invalid segment range [1, 1]`. It is now `low > high_segid`, so only a
+  genuinely empty range is an error; that still covers a file that has never
+  been flushed (`get_last_seq() == 0`). The check is extracted as
+  `validate_segid_range` with unit tests pinning the boundary.
 
 - **`prune` no longer fails on the first segment of a small-flush container.**
   `hyperfile 0.4.6` fixed a defect where `Staging::open` always read
@@ -59,11 +87,18 @@ bump rather than a patch.
 
 ### Verified
 
+- 4 unit tests, including the `validate_segid_range` boundary cases.
+- Against real S3, via a downstream CLI:
+  - **Direct bmap** (2 blocks, 2 segments): `2 / 2` reachable, `prune --apply` a
+    no-op, both blocks read back intact. Overwriting both blocks then leaves
+    exactly the two superseded segments unreferenced, and `prune` deletes those
+    two and nothing else, with the data still intact afterwards.
+  - **B+tree bmap** (40 blocks over 40 flushes, root at level 2): `40 / 40`
+    reachable, nothing reclaimable, all 40 blocks intact.
+  - **Single checkpoint**: `collect` and `prune` now answer instead of returning
+    `invalid segment range [1, 1]`.
 - `examples/smoke` against real S3 (3 flushes; `referenced=[1,2,3]`,
   `unreferenced=[]`).
-- `collect` and `prune` driven from a downstream CLI over a 5-checkpoint
-  container: the referenced/unreferenced split matched, the unreferenced segment
-  was actually deleted, and the data read back intact afterwards.
 - Earlier, on `0.4.6`: `collect`/`prune` against a container written by a
   `0.4.6`-based filesystem — 203 segments walked, split correct, data intact
   after pruning.

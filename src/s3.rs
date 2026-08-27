@@ -99,19 +99,77 @@ impl S3Cleaner {
     /// non-leaf-node-stored block pointers. In hyperfile's CoW
     /// model this set is sufficient to identify all segments that
     /// must be retained.
+    /// Collect every segment id that `bmap` still points into.
+    ///
+    /// A bmap comes in two shapes and they have to be walked differently.
+    ///
+    /// A **B+tree** bmap keeps its pointers in intermediate nodes, and
+    /// `nonleafnode_iter` yields every value from the root down to level 1 —
+    /// level 1's values being the data block pointers themselves — so a single
+    /// walk covers live metadata nodes and live data blocks alike.
+    ///
+    /// A **direct** bmap has no intermediate nodes at all: the root, which lives
+    /// inside the inode, holds the data block pointers directly.
+    /// `nonleafnode_iter` yields nothing for it, which is correct for what it
+    /// claims to do but meant this function reported an *empty* referenced set
+    /// for every file small enough to keep a direct bmap. `prune` then deleted
+    /// the segments holding that file's only live data. Verified against real S3
+    /// before the fix: a two-block file lost both blocks, and reads came back
+    /// `NoSuchKey`.
+    ///
+    /// The direct case is walked by key. `seek_key` skips invalid slots and
+    /// reports `NotFound` once none are left, so the walk needs no capacity
+    /// accessor, and it is bounded by the root's slot count — a handful of
+    /// entries, since holding only a handful is what keeps a bmap direct.
+    ///
+    /// The key walk is async while this function is called from
+    /// `spawn_blocking`, so it is driven with `Handle::current().block_on`. That
+    /// is the same way `btree-ondisk` drives itself under its `tokio-runtime`
+    /// feature, which is what `nonleafnode_iter` above already relies on.
     fn collect_segment_id<'a, L>(
         bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
-    ) -> BTreeSet<SegmentId>
+    ) -> Result<BTreeSet<SegmentId>>
     where
         L: BlockLoader<BlockPtr> + Clone,
     {
         let mut segid_set: BTreeSet<SegmentId> = BTreeSet::new();
-        for blkptr in bmap.nonleafnode_iter() {
+        let mut record = |blkptr: BlockPtr| {
             if BlockPtrFormat::is_on_staging(&blkptr) {
                 segid_set.insert(BlockPtrFormat::decode_segid(&blkptr));
             }
+        };
+
+        if bmap.get_stat().btree {
+            for blkptr in bmap.nonleafnode_iter() {
+                record(blkptr);
+            }
+            return Ok(segid_set);
         }
-        segid_set
+
+        let handle = tokio::runtime::Handle::current();
+        let mut next: BlockIndex = 0;
+        loop {
+            let key = match handle.block_on(bmap.seek_key(&next)) {
+                Ok(key) => key,
+                // No populated slot at or after `next`: the walk is done.
+                Err(e) if e.kind() == ErrorKind::NotFound => break,
+                Err(e) => return Err(e),
+            };
+            match handle.block_on(bmap.lookup(&key)) {
+                Ok(blkptr) => record(blkptr),
+                // seek_key and lookup agree on what is populated, so this
+                // should not happen; tolerate it rather than abort the walk.
+                Err(e) if e.kind() == ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+            // A direct bmap is indexed from 0 with no gaps beyond the last
+            // populated slot, so saturating here just ends the walk.
+            match key.checked_add(1) {
+                Some(n) => next = n,
+                None => break,
+            }
+        }
+        Ok(segid_set)
     }
 
     /// Delete `delete_keys` from `bucket` in batches of 1000 (the
@@ -231,10 +289,7 @@ impl S3Cleaner {
         };
 
         debug!("collect unreferenced segment low: {}, high: {}", low, high_segid);
-        if low >= high_segid {
-            let err_msg = format!("invalid segment range [{}, {}]", low, high_segid);
-            return Err(Error::new(ErrorKind::InvalidInput, err_msg));
-        }
+        validate_segid_range(low, high_segid)?;
 
         // load segment summary for the high checkpoint
         let ss = self.load_segment_sum(high_segid).await?;
@@ -254,7 +309,7 @@ impl S3Cleaner {
         let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
             let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
                 ::read(&i_bmap, meta_block_size, loader, NullNodeCache)?;
-            Ok(Self::collect_segment_id(bmap))
+            Self::collect_segment_id(bmap)
         });
         let set = match join.await {
             Ok(inner) => inner?,
@@ -275,6 +330,30 @@ impl S3Cleaner {
         let v_ref = set.into_iter().collect::<Vec<SegmentId>>();
         Ok((v_ref, non_ref))
     }
+}
+
+/// Reject a segid range that cannot be walked.
+///
+/// `[low, high]` is inclusive at both ends, so `low == high_segid` is a
+/// well-formed query — "what does checkpoint N reference, and is anything in
+/// `[N, N]` unreferenced" — and is answered normally. It is reached whenever a
+/// caller asks about the entire history of a file with a single checkpoint:
+/// `collect(1, 0)`, the form this crate's own documentation gives as the typical
+/// call, resolves `high` to `get_last_seq() == 1` and so lands on `low == high`.
+/// Rejecting it made `collect` and `prune` unusable on any freshly created file
+/// until it had been flushed at least twice.
+///
+/// `low > high_segid` is genuinely empty and stays an error, which also covers
+/// `high_segid == 0` (no checkpoint has ever been published, so there is no
+/// metadata tree to walk).
+fn validate_segid_range(low: SegmentId, high_segid: SegmentId) -> Result<()> {
+    if low > high_segid {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid segment range [{}, {}]", low, high_segid),
+        ));
+    }
+    Ok(())
 }
 
 impl Cleaner for S3Cleaner {
@@ -317,5 +396,34 @@ mod tests {
         // Empty list -> no SDK call -> Ok regardless of credentials.
         let r = S3Cleaner::do_delete_objects(&client, "any-bucket", Vec::new()).await;
         assert!(r.is_ok(), "empty key list should not call S3");
+    }
+
+    /// `[low, high]` is inclusive at both ends, so a single-checkpoint
+    /// file -- where `collect(1, 0)` resolves to `low == high == 1` --
+    /// must be accepted. It used to be rejected, which made the
+    /// documented call form fail on any file flushed only once.
+    #[test]
+    fn segid_range_accepts_a_single_checkpoint() {
+        assert!(validate_segid_range(1, 1).is_ok());
+    }
+
+    #[test]
+    fn segid_range_accepts_a_normal_span() {
+        assert!(validate_segid_range(1, 5).is_ok());
+    }
+
+    /// Only a genuinely empty range is an error. `high_segid == 0` is the
+    /// "no checkpoint published yet" case and falls out of the same rule.
+    #[test]
+    fn segid_range_rejects_an_empty_span() {
+        for (low, high) in [(5u64, 3u64), (2, 1), (1, 0)] {
+            let e = validate_segid_range(low, high)
+                .expect_err("low > high must be rejected");
+            assert_eq!(e.kind(), ErrorKind::InvalidInput);
+            assert!(
+                e.to_string().contains(&format!("[{}, {}]", low, high)),
+                "error should name the range, got {:?}", e.to_string(),
+            );
+        }
     }
 }

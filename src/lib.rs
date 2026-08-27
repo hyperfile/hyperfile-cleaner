@@ -64,6 +64,12 @@ pub mod s3;
 /// is a sentinel meaning "use the latest published checkpoint
 /// (`Inode::get_last_seq`)". `low` is inclusive; a typical value is
 /// `1` to cover the entire file history.
+///
+/// The range is inclusive at *both* ends, so `low == high` is valid and
+/// answered normally — which is what `collect(1, 0)` resolves to on a file with
+/// a single checkpoint. Only `low > high` is an error, and that also covers a
+/// file that has never been flushed (`get_last_seq() == 0`), since there is no
+/// metadata tree to walk.
 pub trait Cleaner {
     /// Walk the metadata tree of the checkpoint identified by `high`
     /// (or the latest if `high == 0`) and return
