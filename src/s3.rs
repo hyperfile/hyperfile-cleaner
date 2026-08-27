@@ -94,79 +94,38 @@ impl S3Cleaner {
         Ok((raw_inode, inode_state))
     }
 
-    /// Walk the B+tree starting from the supplied `bmap` root and
-    /// collect the set of segment IDs that hold any of its
-    /// non-leaf-node-stored block pointers. In hyperfile's CoW
-    /// model this set is sufficient to identify all segments that
-    /// must be retained.
     /// Collect every segment id that `bmap` still points into.
     ///
-    /// A bmap comes in two shapes and they have to be walked differently.
+    /// `collect_ptrs` reports every location the map references — its metadata
+    /// nodes and the block pointers stored in its leaves — for both bmap shapes,
+    /// so this needs no shape branch of its own. It returns `Err` rather than a
+    /// short list if any subtree could not be enumerated, which is what makes it
+    /// safe to derive a delete set from: a truncated reachable set is
+    /// indistinguishable from a complete one.
     ///
-    /// A **B+tree** bmap keeps its pointers in intermediate nodes, and
-    /// `nonleafnode_iter` yields every value from the root down to level 1 —
-    /// level 1's values being the data block pointers themselves — so a single
-    /// walk covers live metadata nodes and live data blocks alike.
-    ///
-    /// A **direct** bmap has no intermediate nodes at all: the root, which lives
-    /// inside the inode, holds the data block pointers directly.
-    /// `nonleafnode_iter` yields nothing for it, which is correct for what it
-    /// claims to do but meant this function reported an *empty* referenced set
-    /// for every file small enough to keep a direct bmap. `prune` then deleted
-    /// the segments holding that file's only live data. Verified against real S3
-    /// before the fix: a two-block file lost both blocks, and reads came back
-    /// `NoSuchKey`.
-    ///
-    /// The direct case is walked by key. `seek_key` skips invalid slots and
-    /// reports `NotFound` once none are left, so the walk needs no capacity
-    /// accessor, and it is bounded by the root's slot count — a handful of
-    /// entries, since holding only a handful is what keeps a bmap direct.
-    ///
-    /// The key walk is async while this function is called from
-    /// `spawn_blocking`, so it is driven with `Handle::current().block_on`. That
-    /// is the same way `btree-ondisk` drives itself under its `tokio-runtime`
-    /// feature, which is what `nonleafnode_iter` above already relies on.
-    fn collect_segment_id<'a, L>(
-        bmap: BMap<'a, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
+    /// This replaces a hand-written walk that branched on `get_stat().btree` and
+    /// used `nonleafnode_iter` for the B+tree shape. That iterator yields
+    /// nothing for a direct bmap, whose root lives inside the inode and holds
+    /// the data block pointers itself, so the referenced set came back *empty*
+    /// for every file small enough to keep one and `prune` deleted that file's
+    /// only live data. `btree-ondisk 0.20` owns the shape distinction now.
+    fn collect_segment_id<L>(
+        bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
     ) -> Result<BTreeSet<SegmentId>>
     where
         L: BlockLoader<BlockPtr> + Clone,
     {
         let mut segid_set: BTreeSet<SegmentId> = BTreeSet::new();
-        let mut record = |blkptr: BlockPtr| {
+        // `collect_ptrs` is a plain `async fn`, but a bmap built with
+        // btree-ondisk's `rc` feature is `!Send`, so awaiting it directly
+        // would make `collect`/`prune` non-`Send` and break the `Cleaner`
+        // trait. The walk therefore stays on the blocking thread this
+        // function is called from, driven the same way btree-ondisk drives
+        // itself under `tokio-runtime`.
+        let handle = tokio::runtime::Handle::current();
+        for blkptr in handle.block_on(bmap.collect_ptrs())? {
             if BlockPtrFormat::is_on_staging(&blkptr) {
                 segid_set.insert(BlockPtrFormat::decode_segid(&blkptr));
-            }
-        };
-
-        if bmap.get_stat().btree {
-            for blkptr in bmap.nonleafnode_iter() {
-                record(blkptr);
-            }
-            return Ok(segid_set);
-        }
-
-        let handle = tokio::runtime::Handle::current();
-        let mut next: BlockIndex = 0;
-        loop {
-            let key = match handle.block_on(bmap.seek_key(&next)) {
-                Ok(key) => key,
-                // No populated slot at or after `next`: the walk is done.
-                Err(e) if e.kind() == ErrorKind::NotFound => break,
-                Err(e) => return Err(e),
-            };
-            match handle.block_on(bmap.lookup(&key)) {
-                Ok(blkptr) => record(blkptr),
-                // seek_key and lookup agree on what is populated, so this
-                // should not happen; tolerate it rather than abort the walk.
-                Err(e) if e.kind() == ErrorKind::NotFound => {},
-                Err(e) => return Err(e),
-            }
-            // A direct bmap is indexed from 0 with no gaps beyond the last
-            // populated slot, so saturating here just ends the walk.
-            match key.checked_add(1) {
-                Some(n) => next = n,
-                None => break,
             }
         }
         Ok(segid_set)
@@ -293,12 +252,18 @@ impl S3Cleaner {
 
         // load segment summary for the high checkpoint
         let ss = self.load_segment_sum(high_segid).await?;
-        let i_bmap = ss.hdr.s_inode.i_bmap;
+        // The whole inode is moved into the walk, not just its `i_bmap` field:
+        // `BMap::read` wants an 8-byte-aligned buffer, and `BMapRawType` is
+        // `[u8; N]`, whose own alignment is 1, so a copy of the field alone
+        // lands wherever the compiler put it. `InodeRaw` is `align(8)` and
+        // `i_bmap` sits at an 8-aligned offset within it, so borrowing the
+        // field out of an owned inode is aligned by construction.
+        let raw_inode = ss.hdr.s_inode;
         let meta_block_size = 1 << ss.hdr.s_meta_blk_shift;
 
-        // Walk the B+tree on a blocking thread (btree-ondisk's
-        // sync API parks on the runtime; we don't want to park
-        // the caller's reactor thread).
+        // Walk the bmap on a blocking thread: a bmap built with
+        // btree-ondisk's `rc` feature is `!Send`, so it cannot be held
+        // across an await in a `Cleaner` method.
         // Counters are per-loader and the cleaner has nowhere to report
         // them, so give this walk its own throwaway ReadTiming rather
         // than threading one through the public API.
@@ -308,7 +273,7 @@ impl S3Cleaner {
         );
         let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
             let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
-                ::read(&i_bmap, meta_block_size, loader, NullNodeCache)?;
+                ::read(&raw_inode.i_bmap, meta_block_size, loader, NullNodeCache)?;
             Self::collect_segment_id(bmap)
         });
         let set = match join.await {

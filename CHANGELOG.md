@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.5.0] - 2026-08-27
+
+Moves the reachability walk onto `btree-ondisk 0.20`'s `collect_ptrs`, which
+owns the direct/B+tree distinction that this crate used to branch on by hand.
+The public API is unchanged.
+
+### Breaking changes
+
+- **`btree-ondisk` requirement moves from `^0.18` to `0.20.0`, `hyperfile` from
+  `0.6.10` to `0.6.11`.** cargo treats 0.x minors as incompatible, so a binary
+  that links this crate alongside another `btree-ondisk` consumer has to move
+  both together or end up with two `btree-ondisk`s in its graph and no way to
+  pass a `BMap` between them.
+
+### Changed
+
+- **`collect_segment_id` is one call instead of a shape branch.**
+  `btree-ondisk 0.20` added `BMap::collect_ptrs`, which reports every location a
+  map references — its metadata nodes and the block pointers in its leaves — for
+  both bmap shapes. The B+tree arm (`nonleafnode_iter`) and the direct arm
+  (`seek_key` + `lookup`, added in 0.4.0 to fix the data loss described below)
+  are both gone, along with the per-slot `checked_add` walk.
+
+  This is not just less code: `collect_ptrs` returns `Err` rather than a short
+  list when a subtree cannot be enumerated, so an unreadable metadata node can
+  no longer be mistaken for an absent reference. `nonleafnode_iter` had no way to
+  report that — and a truncated reachable set is what deletes live data.
+
+- **The bmap root handed to `BMap::read` is aligned by construction.** The walk
+  used to copy `i_bmap` out of the segment header into a local; `BMapRawType` is
+  `[u8; N]`, whose alignment is 1, so the copy sat wherever the compiler put it,
+  while `BMap::read` wants 8-byte alignment. It worked on x86-64 and nothing
+  enforced it. The whole `InodeRaw` is moved into the walk now and the field
+  borrowed out of it: `InodeRaw` is `align(8)` and `i_bmap` sits at an 8-aligned
+  offset within it. Same fix as `hyperfile 0.6.11` made at its own three call
+  sites.
+
+- The walk stays on a `spawn_blocking` thread even though `collect_ptrs` is a
+  plain `async fn` and needs no `block_in_place`. This crate builds
+  `btree-ondisk` with `rc`, so a `BMap` holds `Rc<DirectNode<..>>` and is
+  `!Send`; holding one across an await would make `collect` and `prune` non-`Send`
+  and break the `Cleaner` trait's `+ Send` bound. Verified by trying it —
+  22 errors, all rooted at `Rc<DirectNode<'_, u64>>`.
+
+### Verified
+
+- 4 unit tests and the doctest pass; `clippy --all-targets -D warnings` clean.
+- `cargo tree` resolves a single `btree-ondisk 0.20.0`, shared with
+  `hyperfile 0.6.11`.
+- Against real S3, **direct bmap** (2 blocks over 2 flushes, the shape that hit
+  the 0.4.0 data loss): `collect` reports `referenced=[1, 2]`,
+  `unreferenced=[]`; `prune` is a no-op and both blocks read back intact.
+  Overwriting both blocks in one flush then reports `referenced=[3]`,
+  `unreferenced=[1, 2]`; `prune` deletes exactly those two and the new contents
+  read back intact.
+- Against real S3, **B+tree bmap** via `examples/smoke` (3 MiB over 3 flushes,
+  768 data blocks): `referenced=[1, 2, 3]`, `unreferenced=[]`.
+
 ## [0.4.0] - 2026-08-27
 
 Raises the `hyperfile` floor past an on-disk layout change, and fixes a
