@@ -9,20 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
-## [0.6.0] - 2026-09-05
+## [0.7.0] - 2026-09-06
 
 Follows `hyperfile 0.7.0`, where a checkpoint may be written as several objects.
 The unit this crate reports and deletes is now a stored object rather than a
 checkpoint, and the delete set comes from what is on storage rather than from
 arithmetic over the range.
 
+The minor version skips `0.6` to line up with the `hyperfile` release this tracks:
+a reader who knows which `hyperfile` a container was written by knows which cleaner
+speaks to it, and this crate's public types are that crate's types. `0.6.0` was
+tagged locally and never published; everything in it is here.
+
 ### Breaking changes
 
-- **`hyperfile` requirement moves from `0.6.11` to `0.7.0`.** `SegmentId` is no
+- **`hyperfile` requirement moves from `0.6.11` to `0.7`.** `SegmentId` is no
   longer an alias for `u64`: it is a struct naming a stored object — a checkpoint
   number and, under `BlockPtrFormat::PartedSegment`, which of that checkpoint's
   objects. Consumers must move together, since a `SegmentId` from one build is not
   the other's.
+
+  The requirement names the minor, not a patch, so a `0.7.x` fix arrives without an
+  edit here. `hyperfile 0.7.1` is the first one: it repairs the
+  `blocking + wal` build, which is the feature pair a WAL-object reclaim in this
+  crate would need.
 
 - **`Cleaner::collect` and `Cleaner::prune` take `Cno`, not `SegmentId`.** The
   range has always been a range of checkpoint numbers, and `hyperfile 0.7.0` has
@@ -103,8 +113,8 @@ arithmetic over the range.
 - Both of those re-run after `PartedSegment` became the default, where the same
   containers come back as `1.0`, `2.0`, `3.0` and the answers are unchanged.
 - `clippy --all-targets` clean with `-D warnings`, and the parted and default-format
-  runs repeated against the published `hyperfile 0.7.0` from crates.io rather than a
-  local path, with identical results.
+  runs repeated against the published `hyperfile 0.7.0` and again on `0.7.1`, rather
+  than a local path, with identical results.
 
 ## [0.5.0] - 2026-08-27
 
