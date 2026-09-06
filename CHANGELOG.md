@@ -9,6 +9,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.6.0] - 2026-09-05
+
+Follows `hyperfile 0.7.0`, where a checkpoint may be written as several objects.
+The unit this crate reports and deletes is now a stored object rather than a
+checkpoint, and the delete set comes from what is on storage rather than from
+arithmetic over the range.
+
+### Breaking changes
+
+- **`hyperfile` requirement moves from `0.6.11` to `0.7.0`.** `SegmentId` is no
+  longer an alias for `u64`: it is a struct naming a stored object — a checkpoint
+  number and, under `BlockPtrFormat::PartedSegment`, which of that checkpoint's
+  objects. Consumers must move together, since a `SegmentId` from one build is not
+  the other's.
+
+- **`Cleaner::collect` and `Cleaner::prune` take `Cno`, not `SegmentId`.** The
+  range has always been a range of checkpoint numbers, and `hyperfile 0.7.0` has
+  a name for that. Callers passing integer literals are unaffected — `Cno` is
+  `u64` — and `high == 0` still means "the latest published checkpoint", now read
+  from `Inode::get_last_cno()`.
+
+- **The returned lists name objects.** On an unparted container that is what they
+  always were, and a `SegmentId` prints as the plain number. On a parted one they
+  carry a part, so a caller that formats them will see `7.2`.
+
+### Added
+
+- **Parted containers are reclaimable at object granularity.** The referenced set
+  is built with the container's own pointer format, read from the published
+  inode's `i_meta_config`, so a pointer under `PartedSegment` resolves to the
+  object that holds the block rather than to its checkpoint.
+
+  This is not a refinement of checkpoint-granular reclaim, it is what makes any
+  reclaim possible there. A checkpoint abandoned by a rollback or an `abort_txn`
+  leaves its partials on storage, and the retry **reuses the same checkpoint
+  number** — so the dead partials and the live checkpoint share a cno, and
+  anything reasoning in whole checkpoints must keep them forever.
+
+  `hyperfile 0.7.0` makes `PartedSegment` the **default**, so this is the ordinary
+  path rather than one a caller opts into: every container that release creates
+  writes `<cno>.0` objects, and the bare-name case is now only the containers that
+  already exist.
+
+  Two kinds of object are kept even when no pointer names them: the summary of
+  `high`, which is the object the walk itself reads and would read again on the
+  next run; and the summary part of a checkpoint that still has a live part,
+  without which the checkpoint's live blocks would be there but unparseable. The
+  second uses upstream's own predicate, `SegmentId::is_partial` — a partial is a
+  part above zero, and an unparted checkpoint is never one.
+
+### Changed
+
+- **The delete set is what exists, not what the range computes.** `prune` used to
+  build a key per checkpoint number in `[low, high]` and let S3 absorb the ones
+  that were not there. Under a parted container that produces the wrong names —
+  a streamed checkpoint is `<cno>.0`, `<cno>.1`, … with no count the caller knows
+  — and deleting a name that does not exist succeeds, so the failure would have
+  been a silent no-op rather than an error.
+
+  The objects under the container's prefix are listed instead (one paginated
+  `ListObjectsV2`), and names that are not segment objects — the inode, a nested
+  WAL prefix — are skipped. This is also the only way an abandoned partial can be
+  seen at all: nothing references it and no arithmetic names it.
+
+- **The summary object of `high` is resolved before it is read.** It is part 0 on
+  a parted container and the bare name otherwise. `Staging::open` would find it
+  either way — given a bare number with no object of that name it tries the
+  summary part too — but naming it outright saves a 404 on every container
+  `hyperfile 0.7.0` creates.
+
+- A checkpoint number past `u32::MAX` is refused with `InvalidInput`. That is what
+  a block pointer can name, and `SegmentId::new_from_cno` asserts on more in a
+  debug build.
+
+### Verified
+
+- 14 unit tests, covering the object-name parser round-tripping
+  `Segment::segid_to_staging_file_id`, the keys that must not be read as segment
+  objects, and each retain rule — including the abandoned-partial case, which
+  cannot be forced from outside without fault injection.
+- Against real S3, **parted container with real partials** (`examples/parted_smoke`,
+  8 MiB written under a 1 MiB dirty threshold): checkpoint 1 comes back as six
+  objects `1.0` through `1.5`, all referenced, nothing reclaimable, and a `prune`
+  leaves the data intact. Overwriting the file reports exactly those six as
+  reclaimable and nothing of checkpoint 2; after pruning them the data reads back
+  intact and a second `prune` has nothing to do.
+- Against real S3, **unparted container**: `examples/smoke` (3 MiB over 3 flushes)
+  reports `[1, 2, 3]` referenced, none reclaimable. A direct-bmap file (2 blocks,
+  2 checkpoints) reports both referenced with `prune` a no-op and the data intact;
+  overwriting both blocks then makes exactly checkpoints 1 and 2 reclaimable, and
+  the data survives pruning them.
+- Both of those re-run after `PartedSegment` became the default, where the same
+  containers come back as `1.0`, `2.0`, `3.0` and the answers are unchanged.
+- `clippy --all-targets` clean with `-D warnings`, and the parted and default-format
+  runs repeated against the published `hyperfile 0.7.0` from crates.io rather than a
+  local path, with identical results.
+
 ## [0.5.0] - 2026-08-27
 
 Moves the reachability walk onto `btree-ondisk 0.20`'s `collect_ptrs`, which

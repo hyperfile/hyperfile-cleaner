@@ -54,33 +54,40 @@
 //! ```
 
 use std::io::Result;
-use hyperfile::SegmentId;
+use hyperfile::{Cno, SegmentId};
 
 pub mod s3;
 
 /// Operations supported by a hyperfile cleaner backend.
 ///
-/// Both methods take a `[low, high]` segment-id range. `high == 0`
-/// is a sentinel meaning "use the latest published checkpoint
-/// (`Inode::get_last_seq`)". `low` is inclusive; a typical value is
-/// `1` to cover the entire file history.
+/// Both methods take a `[low, high]` range of **checkpoint numbers**
+/// ([`Cno`]). `high == 0` is a sentinel meaning "use the latest published
+/// checkpoint (`Inode::get_last_cno`)". `low` is inclusive; a typical value
+/// is `1` to cover the entire file history.
 ///
 /// The range is inclusive at *both* ends, so `low == high` is valid and
 /// answered normally — which is what `collect(1, 0)` resolves to on a file with
 /// a single checkpoint. Only `low > high` is an error, and that also covers a
-/// file that has never been flushed (`get_last_seq() == 0`), since there is no
+/// file that has never been flushed (`get_last_cno() == 0`), since there is no
 /// metadata tree to walk.
+///
+/// What the methods *report and delete* is [`SegmentId`], which names a stored
+/// object rather than a checkpoint: a checkpoint written under
+/// `BlockPtrFormat::PartedSegment` is several objects — `<cno>.0`, `<cno>.1`, …
+/// — and they are not reclaimable together. Under every other format an object
+/// and a checkpoint are the same thing and a `SegmentId` prints as the plain
+/// number.
 pub trait Cleaner {
     /// Walk the metadata tree of the checkpoint identified by `high`
     /// (or the latest if `high == 0`) and return
-    /// `(referenced, unreferenced)` segment id lists within
-    /// `[low, high]`.
+    /// `(referenced, unreferenced)` lists of segment objects, the
+    /// unreferenced one limited to checkpoints within `[low, high]`.
     ///
     /// Useful for dry-run inspection before invoking [`Cleaner::prune`].
     fn collect(
         &self,
-        low: SegmentId,
-        high: SegmentId,
+        low: Cno,
+        high: Cno,
     ) -> impl Future<Output = Result<(Vec<SegmentId>, Vec<SegmentId>)>> + Send;
 
     /// Walk the metadata tree as in [`Cleaner::collect`] and then
@@ -93,7 +100,7 @@ pub trait Cleaner {
     /// the failed object count and a sample failed key.
     fn prune(
         &self,
-        low: SegmentId,
-        high: SegmentId,
+        low: Cno,
+        high: Cno,
     ) -> impl Future<Output = Result<()>> + Send;
 }

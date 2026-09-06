@@ -14,14 +14,14 @@ use log::{debug, error};
 use btree_ondisk::bmap::BMap;
 use btree_ondisk::BlockLoader;
 use btree_ondisk::NullNodeCache;
-use hyperfile::{BlockIndex, BlockPtr, SegmentId};
+use hyperfile::{BlockIndex, BlockPtr, Cno, SegmentId};
 use hyperfile::file::ReadTiming;
 use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::ondisk::InodeRaw;
 use hyperfile::inode::{Inode, OnDiskState};
 use hyperfile::segment::{Segment, SegmentSum, SegmentReadWrite};
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging};
-use hyperfile::config::HyperFileRuntimeConfig;
+use hyperfile::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use hyperfile::s3uri::S3Uri;
 use hyperfile::meta_format::BlockPtrFormat;
 use crate::Cleaner;
@@ -94,7 +94,7 @@ impl S3Cleaner {
         Ok((raw_inode, inode_state))
     }
 
-    /// Collect every segment id that `bmap` still points into.
+    /// Every location the bmap still points into, as the object that holds it.
     ///
     /// `collect_ptrs` reports every location the map references — its metadata
     /// nodes and the block pointers stored in its leaves — for both bmap shapes,
@@ -103,14 +103,16 @@ impl S3Cleaner {
     /// safe to derive a delete set from: a truncated reachable set is
     /// indistinguishable from a complete one.
     ///
-    /// This replaces a hand-written walk that branched on `get_stat().btree` and
-    /// used `nonleafnode_iter` for the B+tree shape. That iterator yields
-    /// nothing for a direct bmap, whose root lives inside the inode and holds
-    /// the data block pointers itself, so the referenced set came back *empty*
-    /// for every file small enough to keep one and `prune` deleted that file's
-    /// only live data. `btree-ondisk 0.20` owns the shape distinction now.
+    /// The pointers are decoded with the container's own format, so under
+    /// `PartedSegment` the result names `<cno>.<part>` objects rather than
+    /// checkpoints. That granularity is not a refinement, it is required: a
+    /// checkpoint abandoned by a rollback leaves its partials behind and the
+    /// retry reuses the same checkpoint number, so the dead partials and the
+    /// live checkpoint share a cno and nothing keyed by cno alone could tell
+    /// them apart.
     fn collect_segment_id<L>(
         bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
+        fmt: BlockPtrFormat,
     ) -> Result<BTreeSet<SegmentId>>
     where
         L: BlockLoader<BlockPtr> + Clone,
@@ -125,10 +127,49 @@ impl S3Cleaner {
         let handle = tokio::runtime::Handle::current();
         for blkptr in handle.block_on(bmap.collect_ptrs())? {
             if BlockPtrFormat::is_on_staging(&blkptr) {
-                segid_set.insert(BlockPtrFormat::decode_segid(&blkptr));
+                let (segid, _) = BlockPtrFormat::decode(&blkptr, &fmt);
+                segid_set.insert(segid);
             }
         }
         Ok(segid_set)
+    }
+
+    /// Every segment object that exists under the container's prefix.
+    ///
+    /// A segment object is named by [`Segment::segid_to_staging_file_id`]: ten
+    /// digits, and a `.<part>` suffix when the checkpoint was streamed. Anything
+    /// else under the prefix — the inode object, a nested WAL prefix — is not one
+    /// and is skipped, as is any key with a further `/` in it.
+    ///
+    /// The delete set is derived from what is *here*, not from arithmetic over
+    /// `[low, high]`. Two reasons, both new in `hyperfile 0.7.0`: a checkpoint's
+    /// object names are no longer derivable from its number, since a streamed one
+    /// is `<cno>.0`, `<cno>.1`, … with no bound the caller knows; and a partial
+    /// whose checkpoint was abandoned is referenced by nothing and named by
+    /// nothing, so a walk that only visits computed names cannot see it at all.
+    async fn list_segment_objects(&self) -> Result<Vec<SegmentId>> {
+        let prefix = format!("{}/", self.root_path);
+        let mut out = Vec::new();
+        let mut pages = self.client.list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            let page = page.map_err(|e| Error::other(
+                format!("listing segment objects under s3://{}/{} failed: {}",
+                    self.bucket, prefix, e),
+            ))?;
+            for obj in page.contents() {
+                let Some(key) = obj.key() else { continue };
+                let Some(name) = key.strip_prefix(&prefix) else { continue };
+                if let Some(segid) = parse_segment_object_name(name) {
+                    out.push(segid);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Delete `delete_keys` from `bucket` in batches of 1000 (the
@@ -225,32 +266,45 @@ impl S3Cleaner {
     }
 
     /// Inner shared implementation used by both `collect` and
-    /// `prune`. Returns `(referenced, unreferenced)` segment id
-    /// vectors where:
-    ///  - `referenced` is the set of segids reachable via the
-    ///    latest published inode's metadata tree, intersected with
-    ///    `[low, high]`.
-    ///  - `unreferenced` is `[low, high]` minus the referenced set.
+    /// `prune`. Returns `(referenced, unreferenced)` lists of segment
+    /// *objects* where:
+    ///  - `referenced` is every object the latest published inode's metadata
+    ///    tree still points into, whether or not it falls in `[low, high]`.
+    ///  - `unreferenced` is every object that exists under the container's
+    ///    prefix whose checkpoint number falls in `[low, high]` and which
+    ///    nothing points into, less the two kinds this keeps regardless (see
+    ///    [`partition_objects`]).
     ///
     /// `high == 0` is a sentinel meaning "use the latest checkpoint
-    /// (`inode.get_last_seq()`)".
+    /// (`inode.get_last_cno()`)".
     async fn collect_unref_seg(
         &self,
-        low: SegmentId,
-        high: SegmentId,
+        low: Cno,
+        high: Cno,
     ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
-        let high_segid = if high == 0 {
-            let (raw_inode, inode_state) = self.load_raw_inode().await?;
+        // Read unconditionally, not only for the `high == 0` sentinel: the
+        // container's pointer format lives in the inode, and it decides both
+        // which object holds a checkpoint's summary and how a pointer decodes.
+        let (raw_inode, inode_state) = self.load_raw_inode().await?;
+        let fmt = container_ptr_format(&raw_inode);
+        let high_cno = if high == 0 {
             let inode = Inode::from_raw(&raw_inode, inode_state);
-            inode.get_last_seq()
+            inode.get_last_cno()
         } else {
             high
         };
 
-        debug!("collect unreferenced segment low: {}, high: {}", low, high_segid);
-        validate_segid_range(low, high_segid)?;
+        debug!("collect unreferenced segment low: {}, high: {}, format: {:?}",
+            low, high_cno, fmt);
+        validate_segid_range(low, high_cno)?;
 
-        // load segment summary for the high checkpoint
+        // Which object holds this checkpoint's summary, metadata and inode:
+        // part 0 when the container streams its checkpoints, the bare name
+        // otherwise. `Staging::open` would find it either way — given a bare
+        // number with no object of that name it tries the summary part too —
+        // but naming it outright saves a 404 on every parted container, which
+        // since `hyperfile 0.7.0` is every container it creates.
+        let high_segid = summary_obj(high_cno, &fmt);
         let ss = self.load_segment_sum(high_segid).await?;
         // The whole inode is moved into the walk, not just its `i_bmap` field:
         // `BMap::read` wants an 8-byte-aligned buffer, and `BMapRawType` is
@@ -258,7 +312,7 @@ impl S3Cleaner {
         // lands wherever the compiler put it. `InodeRaw` is `align(8)` and
         // `i_bmap` sits at an 8-aligned offset within it, so borrowing the
         // field out of an owned inode is aligned by construction.
-        let raw_inode = ss.hdr.s_inode;
+        let ss_inode = ss.hdr.s_inode;
         let meta_block_size = 1 << ss.hdr.s_meta_blk_shift;
 
         // Walk the bmap on a blocking thread: a bmap built with
@@ -273,8 +327,8 @@ impl S3Cleaner {
         );
         let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
             let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
-                ::read(&raw_inode.i_bmap, meta_block_size, loader, NullNodeCache)?;
-            Self::collect_segment_id(bmap)
+                ::read(&ss_inode.i_bmap, meta_block_size, loader, NullNodeCache)?;
+            Self::collect_segment_id(bmap, fmt)
         });
         let set = match join.await {
             Ok(inner) => inner?,
@@ -285,37 +339,156 @@ impl S3Cleaner {
             }
         };
 
-        // Build the unreferenced list within [low, high].
-        let mut non_ref = Vec::new();
-        for n in low..=high_segid {
-            if !set.contains(&n) {
-                non_ref.push(n);
-            }
-        }
-        let v_ref = set.into_iter().collect::<Vec<SegmentId>>();
-        Ok((v_ref, non_ref))
+        let existing = self.list_segment_objects().await?;
+        Ok(partition_objects(&existing, &set, low, high_cno, high_segid))
     }
 }
 
-/// Reject a segid range that cannot be walked.
+/// The pointer format the container was written with, as its inode records it.
 ///
-/// `[low, high]` is inclusive at both ends, so `low == high_segid` is a
+/// Falls back to the pre-parting format rather than failing. A container written
+/// before `i_meta_config` was populated carries zero there, which decodes to
+/// nothing usable — and a container that old cannot be parted, because parting
+/// did not exist. The only thing this decides is how a pointer's low bits are
+/// read and which name holds a summary, and for every format but
+/// `PartedSegment` those are what they have always been.
+fn container_ptr_format(raw_inode: &InodeRaw) -> BlockPtrFormat {
+    match HyperFileMetaConfig::try_from_u32(raw_inode.i_meta_config) {
+        Ok(cfg) => cfg.block_ptr_format,
+        Err(e) => {
+            debug!("inode meta config {:#x} is not one this build can read ({}); \
+                reading pointers as {:?}", raw_inode.i_meta_config, e,
+                BlockPtrFormat::MicroGroup);
+            BlockPtrFormat::MicroGroup
+        },
+    }
+}
+
+/// The object holding a checkpoint's summary, metadata blocks and inode.
+fn summary_obj(cno: Cno, fmt: &BlockPtrFormat) -> SegmentId {
+    let segid = SegmentId::new_from_cno(cno);
+    if fmt.is_parted() {
+        segid.at_part(Segment::SUMMARY_PART)
+    } else {
+        segid
+    }
+}
+
+/// A segment object name, or `None` for a key that is not one.
+///
+/// The names are what [`Segment::segid_to_staging_file_id`] produces: ten digits
+/// zero-padded, optionally `.<part>`. `None` and `Some(0)` are different names
+/// on purpose upstream, so they stay different objects here.
+fn parse_segment_object_name(name: &str) -> Option<SegmentId> {
+    // Nested prefixes — a WAL root under the container, say — are not segment
+    // objects of this container.
+    if name.contains('/') {
+        return None;
+    }
+    let (seq_str, part_str) = match name.split_once('.') {
+        Some((seq, part)) => (seq, Some(part)),
+        None => (name, None),
+    };
+    if seq_str.len() != 10 || !seq_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Ten digits can name more than a `u32` holds; such an object cannot have
+    // been written by this format, so it is not one of ours.
+    let seq_id = seq_str.parse::<u32>().ok()?;
+    match part_str {
+        None => Some(SegmentId::new(seq_id)),
+        Some(p) => {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(SegmentId::with_part(seq_id, p.parse::<u16>().ok()?))
+        },
+    }
+}
+
+/// Split what exists into what is still pointed into and what can go.
+///
+/// `referenced` is object-granular, which is what makes a parted container
+/// reclaimable at all. Two kinds of object are kept even when no pointer names
+/// them:
+///
+/// - **The summary of `high`.** It is the object this cleaner just read to find
+///   the checkpoint's bmap, and the one it would read on the next run. A
+///   container whose newest checkpoint holds no live block — an empty file, or
+///   one whose every block was superseded within the same checkpoint — would
+///   otherwise have its own head deleted, and the next `collect` would fail with
+///   `NoSuchKey`.
+/// - **The summary part of a checkpoint that still has a live part.** Only
+///   reachable under `PartedSegment`: the parts carry data, part 0 carries the
+///   summary and metadata that describe them. Deleting it would leave a
+///   checkpoint whose blocks are live but which nothing can parse, which is what
+///   `open_cno` and a repair tool need. "Not a partial" is upstream's own
+///   predicate for that object — a partial is a part above zero, and an unparted
+///   checkpoint is never one.
+///
+/// Everything else in `[low, high]` that nothing points into is reclaimable,
+/// including the partials of a checkpoint that was abandoned — those share their
+/// checkpoint number with the retry that replaced them, so they are invisible to
+/// anything reasoning in whole checkpoints.
+fn partition_objects(
+    existing: &[SegmentId],
+    referenced: &BTreeSet<SegmentId>,
+    low: Cno,
+    high: Cno,
+    high_summary: SegmentId,
+) -> (Vec<SegmentId>, Vec<SegmentId>) {
+    let live_cnos: BTreeSet<Cno> = referenced.iter().map(|s| s.as_cno()).collect();
+    let mut unref = Vec::new();
+    for obj in existing {
+        let cno = obj.as_cno();
+        if cno < low || cno > high {
+            continue;
+        }
+        if referenced.contains(obj) {
+            continue;
+        }
+        if *obj == high_summary {
+            continue;
+        }
+        if !obj.is_partial() && live_cnos.contains(&cno) {
+            continue;
+        }
+        unref.push(*obj);
+    }
+    let v_ref = referenced.iter().copied().collect::<Vec<SegmentId>>();
+    (v_ref, unref)
+}
+
+/// Reject a checkpoint range that cannot be walked.
+///
+/// `[low, high]` is inclusive at both ends, so `low == high_cno` is a
 /// well-formed query — "what does checkpoint N reference, and is anything in
 /// `[N, N]` unreferenced" — and is answered normally. It is reached whenever a
 /// caller asks about the entire history of a file with a single checkpoint:
 /// `collect(1, 0)`, the form this crate's own documentation gives as the typical
-/// call, resolves `high` to `get_last_seq() == 1` and so lands on `low == high`.
+/// call, resolves `high` to `get_last_cno() == 1` and so lands on `low == high`.
 /// Rejecting it made `collect` and `prune` unusable on any freshly created file
 /// until it had been flushed at least twice.
 ///
-/// `low > high_segid` is genuinely empty and stays an error, which also covers
-/// `high_segid == 0` (no checkpoint has ever been published, so there is no
+/// `low > high_cno` is genuinely empty and stays an error, which also covers
+/// `high_cno == 0` (no checkpoint has ever been published, so there is no
 /// metadata tree to walk).
-fn validate_segid_range(low: SegmentId, high_segid: SegmentId) -> Result<()> {
-    if low > high_segid {
+///
+/// A checkpoint number past `u32::MAX` is refused rather than truncated: that is
+/// what a block pointer can name, so no object could carry the number, and
+/// `SegmentId::new_from_cno` would assert on it in a debug build.
+fn validate_segid_range(low: Cno, high_cno: Cno) -> Result<()> {
+    if low > high_cno {
         return Err(Error::new(
             ErrorKind::InvalidInput,
-            format!("invalid segment range [{}, {}]", low, high_segid),
+            format!("invalid segment range [{}, {}]", low, high_cno),
+        ));
+    }
+    if high_cno > u32::MAX as Cno {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("checkpoint {} is past what a block pointer can name ({})",
+                high_cno, u32::MAX),
         ));
     }
     Ok(())
@@ -324,16 +497,16 @@ fn validate_segid_range(low: SegmentId, high_segid: SegmentId) -> Result<()> {
 impl Cleaner for S3Cleaner {
     async fn collect(
         &self,
-        low: SegmentId,
-        high: SegmentId,
+        low: Cno,
+        high: Cno,
     ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
         self.collect_unref_seg(low, high).await
     }
 
-    /// Prune unreferenced segments in `[low, high]`. Implemented
+    /// Prune unreferenced segment objects in `[low, high]`. Implemented
     /// as `collect` followed by `DeleteObjects` of the
     /// unreferenced list.
-    async fn prune(&self, low: SegmentId, high: SegmentId) -> Result<()> {
+    async fn prune(&self, low: Cno, high: Cno) -> Result<()> {
         let (_, non_ref) = self.collect_unref_seg(low, high).await?;
         let delete_keys = non_ref.iter()
             .map(|segid| format!(
@@ -390,5 +563,147 @@ mod tests {
                 "error should name the range, got {:?}", e.to_string(),
             );
         }
+    }
+
+    /// A checkpoint number no pointer could name is refused rather than
+    /// truncated into one that names a different object.
+    #[test]
+    fn segid_range_rejects_a_checkpoint_past_a_pointer() {
+        let e = validate_segid_range(1, u32::MAX as Cno + 1)
+            .expect_err("a cno past u32::MAX must be rejected");
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert!(validate_segid_range(1, u32::MAX as Cno).is_ok());
+    }
+
+    // --- object names ---
+
+    #[test]
+    fn object_names_round_trip_through_the_parser() {
+        for segid in [
+            SegmentId::new(1),
+            SegmentId::new(4294967295),
+            SegmentId::with_part(7, 0),
+            SegmentId::with_part(7, 16383),
+        ] {
+            let name = Segment::segid_to_staging_file_id(segid);
+            assert_eq!(parse_segment_object_name(&name), Some(segid),
+                "name {:?} did not parse back", name);
+        }
+    }
+
+    /// An unsuffixed name and part 0 are different objects upstream, so they
+    /// have to stay different here — sharing them would mean deleting the
+    /// summary of one container shape while reporting the other.
+    #[test]
+    fn a_bare_name_is_not_part_zero() {
+        assert_eq!(parse_segment_object_name("0000000007"), Some(SegmentId::new(7)));
+        assert_eq!(parse_segment_object_name("0000000007.0"),
+            Some(SegmentId::with_part(7, 0)));
+    }
+
+    #[test]
+    fn keys_that_are_not_segment_objects_are_skipped() {
+        for name in [
+            "inode",              // the inode object
+            "wal/0000000001",     // a nested prefix, not an object of ours
+            "0000000001/0_0_4096",
+            "000000001",          // nine digits
+            "00000000012",        // eleven
+            "9999999999",         // ten digits, past what a u32 can hold
+            "0000000001.",        // empty part
+            "0000000001.x",
+            "0000000001.65536",   // past what a u16 can hold
+            "0000000001.0.1",
+            "",
+        ] {
+            assert_eq!(parse_segment_object_name(name), None,
+                "{:?} should not be read as a segment object", name);
+        }
+    }
+
+    // --- what gets reclaimed ---
+
+    fn partition(
+        existing: &[SegmentId],
+        referenced: &[SegmentId],
+        low: Cno,
+        high: Cno,
+        high_summary: SegmentId,
+    ) -> Vec<SegmentId> {
+        let set: BTreeSet<SegmentId> = referenced.iter().copied().collect();
+        let (_, unref) = partition_objects(existing, &set, low, high, high_summary);
+        unref
+    }
+
+    /// The unparted case, which is every container written before 0.7.0: an
+    /// object is a checkpoint, and one nothing points into goes.
+    #[test]
+    fn an_unreferenced_checkpoint_is_reclaimable() {
+        let existing = [SegmentId::new(1), SegmentId::new(2), SegmentId::new(3)];
+        let unref = partition(&existing, &[SegmentId::new(3)], 1, 3, SegmentId::new(3));
+        assert_eq!(unref, vec![SegmentId::new(1), SegmentId::new(2)]);
+    }
+
+    /// Objects outside `[low, high]` are not candidates, which is what makes a
+    /// prune safe against a writer publishing underneath it.
+    #[test]
+    fn objects_outside_the_range_are_left_alone() {
+        let existing = [
+            SegmentId::new(1), SegmentId::new(2), SegmentId::new(3), SegmentId::new(4),
+        ];
+        let unref = partition(&existing, &[], 2, 3, SegmentId::new(9));
+        assert_eq!(unref, vec![SegmentId::new(2), SegmentId::new(3)]);
+    }
+
+    /// A checkpoint whose newest state holds no live block would otherwise have
+    /// its own head deleted, and the next `collect` would fail to read it.
+    #[test]
+    fn the_summary_of_high_is_kept_even_when_nothing_points_into_it() {
+        let existing = [SegmentId::new(1), SegmentId::new(2)];
+        let unref = partition(&existing, &[], 1, 2, SegmentId::new(2));
+        assert_eq!(unref, vec![SegmentId::new(1)]);
+
+        // Same for a streamed container, where the head is part 0.
+        let existing = [SegmentId::with_part(2, 0), SegmentId::with_part(2, 1)];
+        let unref = partition(&existing, &[], 1, 2, SegmentId::with_part(2, 0));
+        assert_eq!(unref, vec![SegmentId::with_part(2, 1)]);
+    }
+
+    /// The partials of an abandoned checkpoint share their number with the
+    /// retry that replaced them. Reclaiming them is the whole reason the
+    /// referenced set is object-granular.
+    #[test]
+    fn an_abandoned_partial_is_reclaimable_while_its_checkpoint_lives() {
+        let existing = [
+            SegmentId::with_part(5, 0), // summary of the checkpoint that landed
+            SegmentId::with_part(5, 1), // its data
+            SegmentId::with_part(5, 2), // written, then abandoned by a rollback
+        ];
+        let referenced = [SegmentId::with_part(5, 0), SegmentId::with_part(5, 1)];
+        let unref = partition(&existing, &referenced, 1, 9, SegmentId::with_part(9, 0));
+        assert_eq!(unref, vec![SegmentId::with_part(5, 2)]);
+    }
+
+    /// A live checkpoint has to stay parseable: its data parts are named by
+    /// pointers, its summary is what describes them.
+    #[test]
+    fn the_summary_part_of_a_live_checkpoint_is_kept() {
+        let existing = [SegmentId::with_part(4, 0), SegmentId::with_part(4, 3)];
+        let unref = partition(&existing, &[SegmentId::with_part(4, 3)], 1, 9,
+            SegmentId::with_part(9, 0));
+        assert!(unref.is_empty(), "part 0 describes the live part 3, got {:?}", unref);
+    }
+
+    /// With no live part left, the summary goes too — otherwise a parted
+    /// container would never give any storage back.
+    #[test]
+    fn a_wholly_dead_parted_checkpoint_goes_including_its_summary() {
+        let existing = [
+            SegmentId::with_part(4, 0), SegmentId::with_part(4, 1),
+            SegmentId::with_part(6, 0),
+        ];
+        let unref = partition(&existing, &[SegmentId::with_part(6, 0)], 1, 9,
+            SegmentId::with_part(6, 0));
+        assert_eq!(unref, vec![SegmentId::with_part(4, 0), SegmentId::with_part(4, 1)]);
     }
 }
