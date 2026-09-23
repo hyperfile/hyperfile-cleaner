@@ -22,12 +22,60 @@ Two operations on the [`Cleaner`] trait:
 ends; `high == 0` is a sentinel for "use the latest checkpoint".
 
 What is reported and deleted is a `SegmentId`, which names a stored
-object. Under `BlockPtrFormat::PartedSegment` one checkpoint may be
-several objects — `7.0`, `7.1`, … — and they are reclaimed
-separately, because a checkpoint abandoned partway leaves its
-partials behind under the same number the retry then reuses. Under
-every other format an object is a checkpoint and prints as the
-plain number.
+object. Under `BlockPtrFormat::PartedSegment` — the default since
+`hyperfile 0.7.0` — one checkpoint may be several objects, `7.0`,
+`7.1`, … — and they are reclaimed separately, because a checkpoint
+abandoned partway leaves its partials behind under the same number
+the retry then reuses. Under every other format an object is a
+checkpoint and prints as the plain number.
+
+## Compaction
+
+`prune` reclaims an object nothing points into. An object that is 5%
+live is not that object: rewriting those few blocks elsewhere is what
+turns it into one `prune` can take. The same rewrite is what makes a
+read cheaper, since a request breaks where the object changes.
+
+Two more operations, on `S3Cleaner` itself:
+
+- **`report(low, high)`** — read-only. Per-object liveness and what
+  could be given back: `dead()` is `prune`'s work, `compactable(ratio)`
+  estimates what a rewrite would cost and free.
+- **`compact(low, high, &opts)`** — rewrites the live blocks of objects
+  at or below `max_live_ratio`, one checkpoint per batch. Deletes
+  nothing; `prune` does that afterwards.
+
+```rust,no_run
+use hyperfile_cleaner::{Cleaner, compact::CompactOptions, s3::S3Cleaner};
+
+# async fn run() -> std::io::Result<()> {
+let cleaner = S3Cleaner::new("s3://my-bucket/path/to/file").await?;
+
+let report = cleaner.report(1, 0).await?;
+let (objects, rewrite, freed) = report.compactable(0.5);
+println!("{objects} objects: rewrite {rewrite} bytes to free {freed}");
+
+cleaner.compact(1, 0, &CompactOptions::default()).await?;
+cleaner.prune(1, 0).await?;
+# Ok(())
+# }
+```
+
+The rewrite is `hyperfile`'s, not this crate's: `fs_read_ahead` warms
+a run of blocks with the read path's own coalescing, `fs_block_mut`
+marks them dirty without changing their contents, and the flush writes
+the dirty set — sorted by block index and packed — as one object.
+Holes and explicit zero blocks are left alone, so a sparse file stays
+sparse.
+
+**Compaction requires exclusive write access.** It is a writer, and it
+writes bytes it read earlier, so it runs with
+`FlushConflictPolicy::FailFast` and a concurrent publish makes the pass
+fail rather than overwrite the other writer's newer data. It also
+refuses to run when the container's prefix holds keys that are neither
+the inode nor segment objects, because a WAL is the usual reason and a
+compactor that does not read the log would publish over entries
+recovery has not replayed.
 
 ## Usage
 
@@ -58,7 +106,14 @@ For tools that already have a configured `aws_sdk_s3::Client`, use
   published after that point are outside the configured range and
   remain untouched, as are the partials of a checkpoint a writer has
   open — those carry the number above the published one.
-- Compaction (rewriting partially-live segments) is not supported.
+- Compaction is offline: it needs exclusive write access for the pass,
+  and a container holding a WAL is refused unless the caller overrides
+  it. Compacting a container a writer is actively publishing to needs a
+  background task inside `hyperfile`, not a separate process.
+- An object holding a live metadata node is not a compaction candidate.
+  A node is relocated when the flush rewrites it, which needs something
+  under it dirtied, and which keys a node covers is not visible from
+  here.
 
 ## Status
 

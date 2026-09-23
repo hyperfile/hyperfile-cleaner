@@ -88,13 +88,23 @@ impl S3Cleaner {
         self.staging.open(segid).await
     }
 
+    /// The URI this cleaner was built for, as a writer would need it.
+    pub(crate) fn root_uri(&self) -> String {
+        format!("s3://{}/{}", self.bucket, self.root_path)
+    }
+
+    /// The client, for an operation that needs to open the file itself.
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
     async fn load_raw_inode(&self) -> Result<(InodeRaw, Option<OnDiskState>)> {
         let mut raw_inode = InodeRaw::default();
         let inode_state = self.staging.load_inode(raw_inode.as_mut_u8_slice()).await?;
         Ok((raw_inode, inode_state))
     }
 
-    /// Every location the bmap still points into, as the object that holds it.
+    /// Every location the bmap still points into, split by what holds it.
     ///
     /// `collect_ptrs` reports every location the map references — its metadata
     /// nodes and the block pointers stored in its leaves — for both bmap shapes,
@@ -103,21 +113,18 @@ impl S3Cleaner {
     /// safe to derive a delete set from: a truncated reachable set is
     /// indistinguishable from a complete one.
     ///
-    /// The pointers are decoded with the container's own format, so under
-    /// `PartedSegment` the result names `<cno>.<part>` objects rather than
-    /// checkpoints. That granularity is not a refinement, it is required: a
-    /// checkpoint abandoned by a rollback leaves its partials behind and the
-    /// retry reuses the same checkpoint number, so the dead partials and the
-    /// live checkpoint share a cno and nothing keyed by cno alone could tell
-    /// them apart.
-    fn collect_segment_id<L>(
+    /// `collect_meta_ptrs` is the metadata-node subset of the same walk, and
+    /// reads no leaf node to answer. Having both is what lets an object's live
+    /// bytes be counted — a metadata node is `meta_block_size`, a data block is
+    /// `data_block_size`, and a pointer does not say which it is — and it is what
+    /// tells a compactor which objects it cannot free: a live metadata node is
+    /// not relocatable by rewriting data blocks.
+    fn walk_live_ptrs<L>(
         bmap: BMap<'_, BlockIndex, BlockPtr, BlockPtr, L, NullNodeCache>,
-        fmt: BlockPtrFormat,
-    ) -> Result<BTreeSet<SegmentId>>
+    ) -> Result<LivePtrs>
     where
         L: BlockLoader<BlockPtr> + Clone,
     {
-        let mut segid_set: BTreeSet<SegmentId> = BTreeSet::new();
         // `collect_ptrs` is a plain `async fn`, but a bmap built with
         // btree-ondisk's `rc` feature is `!Send`, so awaiting it directly
         // would make `collect`/`prune` non-`Send` and break the `Cleaner`
@@ -125,21 +132,24 @@ impl S3Cleaner {
         // function is called from, driven the same way btree-ondisk drives
         // itself under `tokio-runtime`.
         let handle = tokio::runtime::Handle::current();
-        for blkptr in handle.block_on(bmap.collect_ptrs())? {
-            if BlockPtrFormat::is_on_staging(&blkptr) {
-                let (segid, _) = BlockPtrFormat::decode(&blkptr, &fmt);
-                segid_set.insert(segid);
-            }
-        }
-        Ok(segid_set)
+        let on_staging = |v: Vec<BlockPtr>| -> BTreeSet<BlockPtr> {
+            v.into_iter().filter(BlockPtrFormat::is_on_staging).collect()
+        };
+        let all = on_staging(handle.block_on(bmap.collect_ptrs())?);
+        let meta = on_staging(handle.block_on(bmap.collect_meta_ptrs())?);
+        Ok(LivePtrs { all, meta })
     }
 
-    /// Every segment object that exists under the container's prefix.
+    /// Every segment object that exists under the container's prefix, with its
+    /// size, and whatever else is there.
     ///
     /// A segment object is named by [`Segment::segid_to_staging_file_id`]: ten
     /// digits, and a `.<part>` suffix when the checkpoint was streamed. Anything
     /// else under the prefix — the inode object, a nested WAL prefix — is not one
-    /// and is skipped, as is any key with a further `/` in it.
+    /// and is skipped, as is any key with a further `/` in it. What was skipped is
+    /// reported rather than discarded: a key under this prefix that is neither the
+    /// inode nor a segment object is most likely a WAL, and a compaction must not
+    /// run against a container whose log it is not reading.
     ///
     /// The delete set is derived from what is *here*, not from arithmetic over
     /// `[low, high]`. Two reasons, both new in `hyperfile 0.7.0`: a checkpoint's
@@ -147,9 +157,9 @@ impl S3Cleaner {
     /// is `<cno>.0`, `<cno>.1`, … with no bound the caller knows; and a partial
     /// whose checkpoint was abandoned is referenced by nothing and named by
     /// nothing, so a walk that only visits computed names cannot see it at all.
-    async fn list_segment_objects(&self) -> Result<Vec<SegmentId>> {
+    async fn list_segment_objects(&self) -> Result<ObjectListing> {
         let prefix = format!("{}/", self.root_path);
-        let mut out = Vec::new();
+        let mut listing = ObjectListing::default();
         let mut pages = self.client.list_objects_v2()
             .bucket(&self.bucket)
             .prefix(&prefix)
@@ -162,14 +172,25 @@ impl S3Cleaner {
             ))?;
             for obj in page.contents() {
                 let Some(key) = obj.key() else { continue };
+                if key == self.staging.inode_file {
+                    continue;
+                }
                 let Some(name) = key.strip_prefix(&prefix) else { continue };
-                if let Some(segid) = parse_segment_object_name(name) {
-                    out.push(segid);
+                match parse_segment_object_name(name) {
+                    Some(segid) => {
+                        listing.objects.push((segid, obj.size().unwrap_or(0).max(0) as u64));
+                    },
+                    None => {
+                        listing.foreign += 1;
+                        if listing.foreign_sample.is_none() {
+                            listing.foreign_sample = Some(key.to_string());
+                        }
+                    },
                 }
             }
         }
-        out.sort();
-        Ok(out)
+        listing.objects.sort();
+        Ok(listing)
     }
 
     /// Delete `delete_keys` from `bucket` in batches of 1000 (the
@@ -265,23 +286,13 @@ impl S3Cleaner {
         }
     }
 
-    /// Inner shared implementation used by both `collect` and
-    /// `prune`. Returns `(referenced, unreferenced)` lists of segment
-    /// *objects* where:
-    ///  - `referenced` is every object the latest published inode's metadata
-    ///    tree still points into, whether or not it falls in `[low, high]`.
-    ///  - `unreferenced` is every object that exists under the container's
-    ///    prefix whose checkpoint number falls in `[low, high]` and which
-    ///    nothing points into, less the two kinds this keeps regardless (see
-    ///    [`partition_objects`]).
+    /// Everything `collect`, `report` and `compact` need from storage, gathered
+    /// once: the checkpoint being walked, the container's pointer format and
+    /// block sizes, every live location, and every object that exists.
     ///
     /// `high == 0` is a sentinel meaning "use the latest checkpoint
     /// (`inode.get_last_cno()`)".
-    async fn collect_unref_seg(
-        &self,
-        low: Cno,
-        high: Cno,
-    ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+    pub(crate) async fn view(&self, low: Cno, high: Cno) -> Result<ContainerView> {
         // Read unconditionally, not only for the `high == 0` sentinel: the
         // container's pointer format lives in the inode, and it decides both
         // which object holds a checkpoint's summary and how a pointer decodes.
@@ -294,8 +305,7 @@ impl S3Cleaner {
             high
         };
 
-        debug!("collect unreferenced segment low: {}, high: {}, format: {:?}",
-            low, high_cno, fmt);
+        debug!("view of container low: {}, high: {}, format: {:?}", low, high_cno, fmt);
         validate_segid_range(low, high_cno)?;
 
         // Which object holds this checkpoint's summary, metadata and inode:
@@ -304,8 +314,8 @@ impl S3Cleaner {
         // number with no object of that name it tries the summary part too —
         // but naming it outright saves a 404 on every parted container, which
         // since `hyperfile 0.7.0` is every container it creates.
-        let high_segid = summary_obj(high_cno, &fmt);
-        let ss = self.load_segment_sum(high_segid).await?;
+        let high_summary = summary_obj(high_cno, &fmt);
+        let ss = self.load_segment_sum(high_summary).await?;
         // The whole inode is moved into the walk, not just its `i_bmap` field:
         // `BMap::read` wants an 8-byte-aligned buffer, and `BMapRawType` is
         // `[u8; N]`, whose own alignment is 1, so a copy of the field alone
@@ -313,7 +323,12 @@ impl S3Cleaner {
         // `i_bmap` sits at an 8-aligned offset within it, so borrowing the
         // field out of an owned inode is aligned by construction.
         let ss_inode = ss.hdr.s_inode;
-        let meta_block_size = 1 << ss.hdr.s_meta_blk_shift;
+        // Both sizes come from the segment header rather than from the inode's
+        // `i_meta_config`: they have been there since the first release, while
+        // that field was zero on containers old enough that it cannot be
+        // decoded at all.
+        let meta_block_size = 1usize << ss.hdr.s_meta_blk_shift;
+        let data_block_size = 1usize << ss.hdr.s_data_blk_shift;
 
         // Walk the bmap on a blocking thread: a bmap built with
         // btree-ondisk's `rc` feature is `!Send`, so it cannot be held
@@ -325,12 +340,12 @@ impl S3Cleaner {
             &self.client, &self.bucket, &self.root_path,
             Arc::new(ReadTiming::default()),
         );
-        let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<SegmentId>> {
+        let join = tokio::task::spawn_blocking(move || -> Result<LivePtrs> {
             let bmap = BMap::<BlockIndex, BlockPtr, BlockPtr, S3BlockLoader, NullNodeCache>
                 ::read(&ss_inode.i_bmap, meta_block_size, loader, NullNodeCache)?;
-            Self::collect_segment_id(bmap, fmt)
+            Self::walk_live_ptrs(bmap)
         });
-        let set = match join.await {
+        let live = match join.await {
             Ok(inner) => inner?,
             Err(join_err) => {
                 return Err(Error::other(
@@ -339,8 +354,88 @@ impl S3Cleaner {
             }
         };
 
-        let existing = self.list_segment_objects().await?;
-        Ok(partition_objects(&existing, &set, low, high_cno, high_segid))
+        let listing = self.list_segment_objects().await?;
+        Ok(ContainerView {
+            low,
+            high_cno,
+            fmt,
+            high_summary,
+            data_block_size,
+            meta_block_size,
+            live,
+            listing,
+        })
+    }
+
+    /// Inner shared implementation used by both `collect` and
+    /// `prune`. Returns `(referenced, unreferenced)` lists of segment
+    /// *objects* where:
+    ///  - `referenced` is every object the latest published inode's metadata
+    ///    tree still points into, whether or not it falls in `[low, high]`.
+    ///  - `unreferenced` is every object that exists under the container's
+    ///    prefix whose checkpoint number falls in `[low, high]` and which
+    ///    nothing points into, less the two kinds this keeps regardless (see
+    ///    [`partition_objects`]).
+    async fn collect_unref_seg(
+        &self,
+        low: Cno,
+        high: Cno,
+    ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+        let view = self.view(low, high).await?;
+        Ok(partition_objects(
+            &view.object_ids(),
+            &view.referenced_objects(),
+            view.low,
+            view.high_cno,
+            view.high_summary,
+        ))
+    }
+}
+
+/// Every live location of a container, and the metadata-node subset of it.
+pub(crate) struct LivePtrs {
+    pub(crate) all: BTreeSet<BlockPtr>,
+    pub(crate) meta: BTreeSet<BlockPtr>,
+}
+
+/// What a listing of the container's prefix found.
+#[derive(Default)]
+pub(crate) struct ObjectListing {
+    /// Segment objects and their sizes, ascending.
+    pub(crate) objects: Vec<(SegmentId, u64)>,
+    /// How many keys under the prefix were neither the inode nor a segment
+    /// object. A WAL root nested under the container is the usual reason.
+    pub(crate) foreign: usize,
+    pub(crate) foreign_sample: Option<String>,
+}
+
+/// One pass over a container's storage, shared by every operation.
+pub(crate) struct ContainerView {
+    pub(crate) low: Cno,
+    pub(crate) high_cno: Cno,
+    pub(crate) fmt: BlockPtrFormat,
+    pub(crate) high_summary: SegmentId,
+    pub(crate) data_block_size: usize,
+    pub(crate) meta_block_size: usize,
+    pub(crate) live: LivePtrs,
+    pub(crate) listing: ObjectListing,
+}
+
+impl ContainerView {
+    pub(crate) fn object_ids(&self) -> Vec<SegmentId> {
+        self.listing.objects.iter().map(|(segid, _)| *segid).collect()
+    }
+
+    /// The objects at least one live location names.
+    pub(crate) fn referenced_objects(&self) -> BTreeSet<SegmentId> {
+        self.live.all.iter()
+            .map(|p| BlockPtrFormat::decode(p, &self.fmt).0)
+            .collect()
+    }
+
+    /// Which object a live location is in.
+    pub(crate) fn object_of(&self, blkptr: &BlockPtr) -> SegmentId {
+        BlockPtrFormat::decode(blkptr, &self.fmt).0
     }
 }
 

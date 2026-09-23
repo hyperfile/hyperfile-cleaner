@@ -9,6 +9,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.7.1] - 2026-09-23
+
+Adds offline compaction: rewriting the live blocks of mostly-dead objects so
+`prune` can reclaim them, and so a read of one file range costs fewer requests.
+Stays inside `0.7` because nothing existing changed shape — and because the minor
+tracks the `hyperfile` release this speaks to.
+
+### Added
+
+- **`S3Cleaner::report(low, high)`** — read-only per-object liveness. For each
+  object in range: its stored bytes, how many live data blocks and live metadata
+  nodes are in it, and what those occupy. `Report::dead()` is what `prune` would
+  take; `Report::compactable(ratio)` estimates what a rewrite would cost and
+  free, from the same rule `compact` selects by, so a dry run and the estimate
+  agree.
+
+  Counting live bytes needs both halves of `btree-ondisk`'s reachability API.
+  `collect_ptrs` reports every live location and `collect_meta_ptrs` the metadata
+  subset, and a pointer does not say which it is — while a metadata node is
+  `meta_block_size` and a data block is `data_block_size`. The split is also what
+  identifies the objects compaction must skip.
+
+- **`S3Cleaner::compact(low, high, &opts)`** and `compact::CompactOptions` —
+  rewrites the live blocks of objects at or below `max_live_ratio`, cheapest
+  first, in batches of `batch_bytes`. One batch is one checkpoint and one object.
+  Deletes nothing: a compaction makes objects reclaimable and `prune` reclaims
+  them, which keeps the destructive step in one place.
+
+  The rewrite is `hyperfile`'s own write path, reached through public API rather
+  than reimplemented here — a second implementation of the segment format would
+  drift from the first. `fs_read_ahead` warms a run of blocks with the read path's
+  coalescing; `fs_block_mut` marks a block dirty on acquisition, which produces a
+  new version at the next flush without changing a byte; the flush writes the
+  dirty set sorted by block index and packed, which is both halves of what
+  compaction is for. `fs_block_state` keeps holes and explicit zero blocks out of
+  it, so a sparse file stays sparse.
+
+  Which blocks are in a candidate object comes from `fs_block_placement`, which
+  answers that per index from the live map. Two other sources were tried and are
+  wrong: `SegmentReadWrite::build_block_map` returns the entries of whatever
+  B+tree leaves an object happens to hold, not the blocks stored in it — on a
+  container written one block per flush it reported checkpoint 34 as holding 34
+  blocks when its object held one — and `SegmentSum::blocks`, which is the right
+  data, has `pub(crate)` fields.
+
+### Notes on the contract
+
+- **Exclusive write access is required**, and not as a nicety. A compactor writes
+  bytes it read earlier, so `hyperfile`'s default `RetryLastWriterWins` would, on
+  a conflict, refresh and republish a stale copy over another writer's newer one.
+  The compacting handle therefore runs with `FailFast`, where a concurrent publish
+  fails the pass instead.
+- **A possible log stops the pass.** Keys under the container's prefix that are
+  neither the inode nor segment objects are refused (`InvalidInput`, naming one),
+  because a WAL is the usual reason and publishing past a log this pass does not
+  read would bury entries recovery has not replayed. `allow_foreign_keys`
+  overrides it.
+- The compacting handle sets `parted_segment_enabled = false` and thresholds above
+  the batch, so nothing publishes mid-batch: a threshold crossing would cut the
+  output into a partial, which is the fragmentation compaction exists to remove.
+- `mtime` and `atime` are restored afterwards; `ctime` moves regardless, since
+  `hyperfile` advances it on any attribute update and it is not settable.
+  `preserve_times` turns the restore off.
+
+### Verified
+
+- 21 unit tests, including candidate selection (dead objects and
+  metadata-holding objects excluded, the ratio as a ceiling, cheapest first),
+  run-grouping for `read_ahead`, and that `compactable` answers from the same rule
+  the pass selects by.
+- Against real S3, `examples/compact_smoke`, four shapes:
+  - **Scattered** (64 blocks, one flush each, so 64 objects): 63 candidates,
+    rewritten in one batch; reading the whole file went from **64 requests to 2**;
+    `prune` then took the 63 objects, 761,856 bytes down to 278,528. Sampled
+    blocks read back byte-correct.
+  - **Mostly dead** (a 4,239,360-byte checkpoint left 1.5% live by an overwrite):
+    16 live blocks rewritten, 65,536 bytes, and `prune` recovered **4,145,152
+    bytes** — 63× what the rewrite cost. Survivors and overwritten blocks both
+    verified. `mtime` unchanged across the pass, `ctime` advanced.
+  - **With a foreign key** (a WAL-shaped object under the prefix): `report` counts
+    it, `compact` refuses with `InvalidInput`, and runs once
+    `allow_foreign_keys` is set.
+  - **Sparse, in four-block batches**: 31 blocks rewritten across 9 checkpoints,
+    which is the batch loop firing mid-sweep rather than only at the tail. Block
+    states are identical before and after — `Zero` stayed `Zero` and `Unmapped`
+    stayed `Unmapped` — so an explicit zero block did not start costing storage
+    and a hole did not make the file dense.
+
+  The chunked `block_placement` sweep needs a file larger than 64 Ki blocks to
+  loop, so it was exercised by setting the chunk to 8 blocks and repeating all
+  four shapes: same numbers throughout.
+
+  Not covered, and argued from the code rather than tested: the `FailFast` path,
+  where a concurrent writer publishes during a pass. Reaching it needs a publish
+  interleaved inside one `compact` call, which from outside the crate is a race
+  rather than a test. Also untested: compaction of a container in a pre-`0.7`
+  unparted format.
+- `collect` / `prune` re-verified after the refactor that put them on the shared
+  container view: the parted and default-format runs answer exactly as before.
+- `clippy --all-targets` clean with `-D warnings`.
+
 ## [0.7.0] - 2026-09-06
 
 Follows `hyperfile 0.7.0`, where a checkpoint may be written as several objects.

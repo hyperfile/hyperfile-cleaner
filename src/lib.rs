@@ -56,6 +56,7 @@
 use std::io::Result;
 use hyperfile::{Cno, SegmentId};
 
+pub mod compact;
 pub mod s3;
 
 /// Operations supported by a hyperfile cleaner backend.
