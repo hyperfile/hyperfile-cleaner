@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.7.2] - 2026-10-04
+
+Fixes a miscount in `compact`'s outcome. Nothing else changed.
+
+### Fixed
+
+- **`CompactOutcome::checkpoints` counted the timestamp restore as a checkpoint.**
+  With `preserve_times` on, which is the default, the field read one higher than
+  the container's latest checkpoint number actually moved.
+
+  The restore goes through `fs_setattr`, and a flush with nothing dirty but the
+  inode's attributes rewrites the inode object only: no segment, no new number. So
+  the restore costs a second inode write and moves `last_cno` not at all. A
+  checkpoint is one per batch, and that is now what the field says and counts; the
+  comment beside the restore, which claimed the opposite, is corrected too.
+
+  Measured against real S3 on a 32-checkpoint file, reported count against the real
+  advance of the latest checkpoint number:
+
+  | | advance | reported before | reported now |
+  |---|---|---|---|
+  | one batch, times restored | +1 | 2 | 1 |
+  | one batch, times not restored | +1 | 1 | 1 |
+  | 8-block batches over 31 blocks | +4 | 5 | 4 |
+  | dry run | 0 | 0 | 0 |
+
+  The `0.7.1` entry below gave the sparse case as 9 checkpoints; it is 8, the same
+  overcount, and is corrected there.
+
+### Notes
+
+- **`compact` advances the latest checkpoint number**, by one per batch. It appends
+  new checkpoints rather than tidying in place; the old objects become reclaimable
+  and `prune` takes them. So after a compaction `high == 0` means the new latest
+  checkpoint, which is what lets the following `prune(low, 0)` reclaim the old ones.
+  A reader pinned to an older number with `open_cno` loses its objects to that
+  `prune`, as it would to any other; compaction only makes objects go dead more
+  often.
+
+### Verified
+
+- 21 unit tests and the doctest pass; `clippy --all-targets` clean with
+  `-D warnings`, checked by exit status rather than by its last line of output.
+- The table above, on real S3, before and after the change.
+- `examples/compact_smoke` re-run end to end: scattered, mostly dead, foreign key,
+  and sparse-in-batches all answer as before, with the sparse case now reporting 8
+  checkpoints.
+
 ## [0.7.1] - 2026-09-23
 
 Adds offline compaction: rewriting the live blocks of mostly-dead objects so
