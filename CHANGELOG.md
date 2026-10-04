@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.2] - 2026-10-04
+
+Error classification is `hyperfile`'s own, called rather than copied.
+
+### Changed
+
+- **`hyperfile` requirement moves to `0.10.2`**, which exports `s3_error_kind`,
+  `s3_code_kind`, `is_condition_failure` and `is_retryable` at its crate root.
+- **The cleaner's copy of the mapping is gone.** `prune`'s `DeleteObjects` and the
+  prefix listing classify their failures with `hyperfile::s3_error_kind`, and a key
+  refused inside a successful `DeleteObjects` with `hyperfile::s3_code_kind`. The
+  kinds a caller sees are therefore `hyperfile`'s by construction, not by agreement.
+
+  The copy had already drifted within the hour it existed: `hyperfile`'s
+  `s3_code_kind` also maps `ExpiredToken` and `InvalidToken` to `PermissionDenied`,
+  `NoSuchUpload` to `NotFound`, `BadGateway` and `GatewayTimeout` to
+  `ResourceBusy`, and `NotImplemented` to `InvalidInput`, which the copy reported as
+  `Other`. A caller now gets those as `hyperfile` does.
+
+  `hyperfile::is_retryable(kind)` is the retry column of the table, for a caller
+  deciding whether to run `prune` again.
+
+### Removed
+
+- The five unit tests that pinned the copied tables. `hyperfile`'s
+  `public_error_kind` covers the mapping from outside that crate, which is where it
+  is now called from.
+
+### Also in `hyperfile 0.10.2`, relevant here
+
+- **`unlink` no longer reports success with objects left behind.** A
+  `DeleteObjects` that refused some keys used to be read as a success. It now fails,
+  with the first refusal's kind. Checked against real S3 by `hyperfile`'s
+  `integration_s3_partial_delete`, in the `blocking` build this crate uses as well
+  as the default one.
+
+### Verified
+
+- 24 unit tests and the doctest; `clippy --all-targets` clean with `-D warnings`, by
+  exit status; `cargo publish --dry-run`.
+- Against real S3: `compact_smoke` (all six shapes), `parted_smoke`, `smoke` and
+  `split_smoke` pass unchanged.
+
 ## [0.10.1] - 2026-10-04
 
 Error kinds follow `hyperfile 0.10.1`'s rule, so a caller decides whether to retry by
