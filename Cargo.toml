@@ -1,6 +1,6 @@
 [package]
 name = "hyperfile-cleaner"
-version = "0.7.2"
+version = "0.9.0"
 edition = "2024"
 description = "Segments cleaner implementation for Hyperfile"
 authors = ["Dai Yiyang"]
@@ -15,8 +15,8 @@ log = "0.4.27"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 aws-config = { version = "1.8.1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.96.0"
-btree-ondisk = { version = "0.20.0", default-features = false, features = ["rc", "tokio-runtime"] }
-hyperfile = { version = "0.7", default-features = false, features = ["blocking"] }
+btree-ondisk = { version = "0.20.1", default-features = false, features = ["rc", "tokio-runtime"] }
+hyperfile = { version = "0.9", default-features = false, features = ["blocking"] }
 
 [dev-dependencies]
 env_logger = "0.11"

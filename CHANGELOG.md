@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.9.0] - 2026-10-04
+
+Follows `hyperfile 0.9.1` and `btree-ondisk 0.20.1`. No source change was needed; what
+this release adds is evidence that the object-granular reclaim and compaction hold on
+the one new shape `hyperfile 0.9` introduces.
+
+The minor skips `0.8` to line up with the `hyperfile` release this tracks, as `0.7`
+did: this crate's public types are that crate's types, and a version that drifts from it
+invites the pairing to be guessed.
+
+### Breaking changes
+
+- **`hyperfile` requirement moves from `0.7` to `0.9`, and `btree-ondisk` from `0.20.0`
+  to `0.20.1`.** Consumers must move together. `btree-ondisk 0.20.1` is not optional:
+  `hyperfile 0.9.1` requires it, because 0.20.0 installed index nodes read back from S3
+  over nodes already changed in memory, after which the handle could never flush again.
+  Compaction is a writer that flushes repeatedly, so it is on the path that bug sat on.
+
+### What `hyperfile 0.9` changed that matters here
+
+- **A checkpoint may be several objects even when no partial segment was written.**
+  Under the parted format, a flush larger than `segment_max_object_bytes` writes
+  data-only parts `<segid>.1…` and then part 0. This was the shape this crate's model
+  rested on, but only ever exercised with partials. It now has its own check (below).
+  The limit defaults to, and cannot exceed, 1 GiB, and is floored at 16 KiB, which is
+  what makes the check possible without writing a gigabyte.
+- **A writable open takes up a checkpoint that reached storage without its inode**, once
+  it checks out, after waiting out 5 s on a fresh one (`0.8.0`). `compact` opens the
+  container writable, so this applies to it. Not exercised here: it needs a publish that
+  dies between the segment and the inode.
+- `HyperFileRuntimeConfig` gained `segment_max_object_bytes` and
+  `segment_mpu_max_concurrency`. `compaction_config` builds the struct with
+  `..HyperFileRuntimeConfig::default()`, so it is unaffected.
+
+### Verified
+
+- `examples/split_smoke` (new), against real S3, with `segment_max_object_bytes` at
+  64 KiB and a 2 MiB checkpoint written in a single flush, so that size alone is why it
+  has several objects:
+  - Checkpoint 1 is **35 objects**, `1.0` to `1.34`, none written as a partial segment.
+  - The 8 parts that each hold one surviving block are referenced and are never offered
+    for reclaim; the 27 that hold nothing are.
+  - `compact` rewrites the 8 survivors in one checkpoint, after which `prune` leaves no
+    object of checkpoint 1, taking storage from 4,468,736 to 2,265,088 bytes.
+  - Survivors and overwritten blocks both read back correct.
+- `parted_smoke`, `smoke` and `compact_smoke` re-run on `0.9.1` with answers identical to
+  `0.7.x`: the six-object parted checkpoint reclaimed exactly, three default-format
+  checkpoints all referenced, and the four compaction shapes (scattered, mostly dead,
+  foreign key, sparse) unchanged.
+- 21 unit tests and the doctest; `clippy --all-targets` clean with `-D warnings`, checked
+  by exit status; `cargo publish --dry-run` builds from the packaged directory.
+
+Still argued from the code rather than tested, as in `0.7.1`: the `FailFast` path, where
+a concurrent writer publishes during a pass, and compaction of a container written in a
+pre-`0.7` unparted format.
+
 ## [0.7.2] - 2026-10-04
 
 Fixes a miscount in `compact`'s outcome. Nothing else changed.
