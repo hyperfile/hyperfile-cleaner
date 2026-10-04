@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.1] - 2026-10-04
+
+Error kinds follow `hyperfile 0.10.1`'s rule, so a caller decides whether to retry by
+the kind alone, whichever crate the error came from.
+
+### Changed
+
+- **`prune` no longer fails with `Interrupted`.** A failed `DeleteObjects` reports the
+  kind of its first failure: `ResourceBusy` for a throttled or failing store,
+  `TimedOut` or `ConnectionReset` for the network, `PermissionDenied` for a denied
+  key, `NotFound` for a missing bucket, `Other` for anything else. By convention
+  `Interrupted` means "just retry", which a denied key does not deserve.
+  `hyperfile 0.10.1` made the same change to its own batch delete.
+
+  A key that failed inside a `DeleteObjects` that itself succeeded carries only S3's
+  error code, so the codes that mean what a status means map to the same kind:
+  `AccessDenied` is `PermissionDenied`, `SlowDown` and `InternalError` are
+  `ResourceBusy`, and so on.
+
+- **Listing the container's prefix reports the failure's kind**, where it was always
+  `Other`. Every operation lists, so a network drop during `collect`, `prune`,
+  `report` or `compact` now says `ConnectionReset` or `TimedOut`.
+
+- **`hyperfile` requirement moves to `0.10.1`.** Errors from `hyperfile`'s own calls
+  reach the caller through this crate unchanged, and only from 0.10.1 do they follow
+  the same rule.
+
+The table both crates answer by:
+
+| kind | retry |
+|---|---|
+| `ConnectionReset`, `TimedOut`, `ResourceBusy` | yes |
+| `AlreadyExists` | not as is |
+| `NotFound`, `PermissionDenied`, `InvalidInput`, `InvalidData`, `Unsupported` | no |
+| `StaleNetworkFileHandle` | no — reopen |
+| `Other` | no |
+
+The mapping is a copy of `hyperfile`'s `s3_error_kind`, which is `pub(crate)`; unit
+tests pin both halves of it, the status table and the per-key codes.
+
+### Verified
+
+- 29 unit tests, five of them new: every status in `hyperfile`'s table, through a
+  constructed SDK service error as well as directly; timeout and build failures; a
+  refused condition recognised by its code in a 200; the per-key codes; and that no
+  status or code maps to `Interrupted`.
+- Against real S3, through the actual `DeleteObjects` path: a bucket that does not
+  exist comes back `NotFound`; a bucket that exists in another region (a 301 the SDK
+  does not follow) comes back `Other`, as `hyperfile` reports it.
+- `clippy --all-targets` clean with `-D warnings`, by exit status.
+
 ## [0.10.0] - 2026-10-04
 
 Follows `hyperfile 0.10.0`. A compaction is no longer seen as a change of content:

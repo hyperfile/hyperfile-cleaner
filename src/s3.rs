@@ -166,7 +166,8 @@ impl S3Cleaner {
             .into_paginator()
             .send();
         while let Some(page) = pages.next().await {
-            let page = page.map_err(|e| Error::other(
+            let page = page.map_err(|e| Error::new(
+                s3_error_kind(&e),
                 format!("listing segment objects under s3://{}/{} failed: {}",
                     self.bucket, prefix, e),
             ))?;
@@ -208,10 +209,13 @@ impl S3Cleaner {
     ///    `AccessDenied`, `NoSuchKey`). The response's `errors`
     ///    list is parsed and each failing key recorded.
     ///
-    /// Returns `Err(Interrupted)` if any key (at either level)
-    /// failed. The error message includes the failed object count
-    /// and a sample failed key. Successfully-deleted keys stay
-    /// deleted (S3 has no transactional batch delete).
+    /// Returns an error if any key (at either level) failed, whose kind is
+    /// that of the **first** failure — the same rule `hyperfile` applies to
+    /// its own batch delete since 0.10.1, so a caller decides whether to
+    /// retry `prune` by the kind alone: a throttled or unreachable store is
+    /// worth another try, a denied key is not. The message includes the
+    /// failed object count and a sample failed key. Successfully-deleted keys
+    /// stay deleted (S3 has no transactional batch delete).
     async fn do_delete_objects(
         client: &Client,
         bucket: &str,
@@ -222,6 +226,7 @@ impl S3Cleaner {
             return Ok(());
         }
         let mut failed_keys: Vec<String> = Vec::new();
+        let mut first_kind: Option<ErrorKind> = None;
         for keys in delete_keys.chunks(1000) {
             let obj_ids = keys.iter()
                 .map(|k| {
@@ -257,6 +262,7 @@ impl S3Cleaner {
                             let msg = e.message.as_deref().unwrap_or("");
                             error!("DeleteObjects per-key failure: key={} code={} message={}",
                                 key, code, msg);
+                            first_kind.get_or_insert(delete_code_kind(e.code.as_deref()));
                             if !key.is_empty() {
                                 failed_keys.push(key);
                             }
@@ -268,6 +274,7 @@ impl S3Cleaner {
                     // failed (we don't know which keys made it).
                     error!("DeleteObjects batch failed (bucket={}, count={}): {}",
                         bucket, keys.len(), sdk_err);
+                    first_kind.get_or_insert(s3_error_kind(&sdk_err));
                     failed_keys.extend(keys.iter().cloned());
                 }
             }
@@ -276,7 +283,7 @@ impl S3Cleaner {
             Ok(())
         } else {
             Err(Error::new(
-                ErrorKind::Interrupted,
+                first_kind.unwrap_or(ErrorKind::Other),
                 format!(
                     "DeleteObjects failed for {} object(s); first failed key: {:?}",
                     failed_keys.len(),
@@ -442,6 +449,87 @@ impl ContainerView {
     /// Which object a live location is in.
     pub(crate) fn object_of(&self, blkptr: &BlockPtr) -> SegmentId {
         BlockPtrFormat::decode(blkptr, &self.fmt).0
+    }
+}
+
+/// The kind an S3 failure is reported with, by `hyperfile`'s rule (0.10.1):
+///
+/// | kind | means | retry |
+/// |---|---|---|
+/// | `ConnectionReset`, `TimedOut` | the network | yes |
+/// | `ResourceBusy` | the store throttling or failing (429, 5xx) | yes |
+/// | `AlreadyExists` | a conditional write refused | not as is |
+/// | `NotFound`, `PermissionDenied`, `InvalidInput` | missing, refused, a bad request | no |
+/// | `Other` | anything else | no |
+///
+/// A copy of `hyperfile::s3commons::s3_error_kind`, which is `pub(crate)`. The two
+/// have to agree, because a caller of this crate sees errors from both and decides
+/// by the kind alone; `status_kind` and `code_kind` carry the tables so the tests
+/// below pin them.
+fn s3_error_kind<E, R>(err: &aws_sdk_s3::error::SdkError<E, R>) -> ErrorKind
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+    R: HttpStatus,
+{
+    use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+    match err {
+        SdkError::TimeoutError(_) => ErrorKind::TimedOut,
+        SdkError::DispatchFailure(_) => ErrorKind::ConnectionReset,
+        SdkError::ConstructionFailure(_) => ErrorKind::InvalidInput,
+        // A response that arrived but could not be read — most often one cut off
+        // part-way, which is the network again.
+        SdkError::ResponseError(_) => ErrorKind::ConnectionReset,
+        _ => {
+            // A refused condition is reported by code as well as by status:
+            // a directory bucket answers some with 200 and the error in the body.
+            if matches!(err.code(), Some("PreconditionFailed" | "ConditionalRequestConflict")) {
+                return ErrorKind::AlreadyExists;
+            }
+            status_kind(err.raw_response().map(|r| r.status_u16()))
+        },
+    }
+}
+
+/// The status half of [`s3_error_kind`].
+fn status_kind(status: Option<u16>) -> ErrorKind {
+    match status {
+        Some(404) => ErrorKind::NotFound,
+        Some(403) => ErrorKind::PermissionDenied,
+        Some(408) => ErrorKind::TimedOut,
+        Some(409 | 412) => ErrorKind::AlreadyExists,
+        Some(429 | 500 | 502 | 503 | 504) => ErrorKind::ResourceBusy,
+        Some(400 | 405 | 411 | 416 | 501) => ErrorKind::InvalidInput,
+        _ => ErrorKind::Other,
+    }
+}
+
+/// The kind of one key's failure inside a `DeleteObjects` that itself succeeded.
+///
+/// Such a failure has no status of its own, only S3's error code, so the codes
+/// that correspond to the statuses above are mapped to the same kinds.
+fn delete_code_kind(code: Option<&str>) -> ErrorKind {
+    match code {
+        Some("AccessDenied" | "AllAccessDisabled" | "AccountProblem"
+            | "InvalidAccessKeyId" | "SignatureDoesNotMatch") => ErrorKind::PermissionDenied,
+        Some("NoSuchKey" | "NoSuchBucket" | "NoSuchVersion") => ErrorKind::NotFound,
+        Some("SlowDown" | "InternalError" | "ServiceUnavailable" | "Throttling"
+            | "ThrottlingException" | "RequestLimitExceeded" | "TooManyRequests") => ErrorKind::ResourceBusy,
+        Some("RequestTimeout") => ErrorKind::TimedOut,
+        Some("PreconditionFailed" | "ConditionalRequestConflict" | "OperationAborted") => ErrorKind::AlreadyExists,
+        Some("InvalidArgument" | "InvalidRequest" | "MalformedXML" | "KeyTooLongError") => ErrorKind::InvalidInput,
+        _ => ErrorKind::Other,
+    }
+}
+
+/// What [`s3_error_kind`] needs of a raw response: its status. A trait rather than
+/// the SDK's response type so the mapping does not name it.
+trait HttpStatus {
+    fn status_u16(&self) -> u16;
+}
+
+impl HttpStatus for aws_sdk_s3::config::http::HttpResponse {
+    fn status_u16(&self) -> u16 {
+        self.status().as_u16()
     }
 }
 
@@ -695,6 +783,93 @@ mod tests {
                 e.to_string().contains(&format!("[{}, {}]", low, high)),
                 "error should name the range, got {:?}", e.to_string(),
             );
+        }
+    }
+
+    // --- error kinds, aligned with hyperfile 0.10.1 ---
+
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+    use aws_sdk_s3::operation::delete_objects::DeleteObjectsError;
+
+    fn service_error(status: u16, code: Option<&str>) -> SdkError<DeleteObjectsError, HttpResponse> {
+        let mut meta = ErrorMetadata::builder();
+        if let Some(code) = code {
+            meta = meta.code(code);
+        }
+        let resp = HttpResponse::new(
+            status.try_into().expect("a valid status"),
+            aws_sdk_s3::primitives::SdkBody::empty(),
+        );
+        SdkError::service_error(DeleteObjectsError::generic(meta.build()), resp)
+    }
+
+    /// The table both crates answer by. If hyperfile moves a status, this is the
+    /// test that should fail first.
+    #[test]
+    fn statuses_map_as_hyperfile_maps_them() {
+        for (status, kind) in [
+            (404, ErrorKind::NotFound),
+            (403, ErrorKind::PermissionDenied),
+            (408, ErrorKind::TimedOut),
+            (409, ErrorKind::AlreadyExists),
+            (412, ErrorKind::AlreadyExists),
+            (429, ErrorKind::ResourceBusy),
+            (500, ErrorKind::ResourceBusy),
+            (503, ErrorKind::ResourceBusy),
+            (400, ErrorKind::InvalidInput),
+            (501, ErrorKind::InvalidInput),
+            (418, ErrorKind::Other),
+        ] {
+            assert_eq!(status_kind(Some(status)), kind, "status {}", status);
+            assert_eq!(s3_error_kind(&service_error(status, None)), kind, "status {}", status);
+        }
+        assert_eq!(status_kind(None), ErrorKind::Other);
+    }
+
+    /// A request that never got an answer is the network, or a bad request.
+    #[test]
+    fn transport_failures_are_retryable_and_build_failures_are_not() {
+        let timeout: SdkError<DeleteObjectsError, HttpResponse> = SdkError::timeout_error("slow");
+        assert_eq!(s3_error_kind(&timeout), ErrorKind::TimedOut);
+        let build: SdkError<DeleteObjectsError, HttpResponse> = SdkError::construction_failure("bad");
+        assert_eq!(s3_error_kind(&build), ErrorKind::InvalidInput);
+    }
+
+    /// A refused condition is told apart by its code too: a directory bucket can
+    /// carry one in a 200.
+    #[test]
+    fn a_refused_condition_is_recognised_by_its_code() {
+        assert_eq!(s3_error_kind(&service_error(200, Some("PreconditionFailed"))),
+            ErrorKind::AlreadyExists);
+        assert_eq!(s3_error_kind(&service_error(200, Some("ConditionalRequestConflict"))),
+            ErrorKind::AlreadyExists);
+    }
+
+    /// A key that failed inside a successful `DeleteObjects` has only a code. The
+    /// codes that mean the same as a status map to the same kind, and the one
+    /// distinction that matters for `prune` holds: busy is retryable, denied is not.
+    #[test]
+    fn per_key_delete_codes_map_to_the_same_kinds() {
+        assert_eq!(delete_code_kind(Some("AccessDenied")), ErrorKind::PermissionDenied);
+        assert_eq!(delete_code_kind(Some("SlowDown")), ErrorKind::ResourceBusy);
+        assert_eq!(delete_code_kind(Some("InternalError")), ErrorKind::ResourceBusy);
+        assert_eq!(delete_code_kind(Some("ServiceUnavailable")), ErrorKind::ResourceBusy);
+        assert_eq!(delete_code_kind(Some("RequestTimeout")), ErrorKind::TimedOut);
+        assert_eq!(delete_code_kind(Some("NoSuchBucket")), ErrorKind::NotFound);
+        assert_eq!(delete_code_kind(Some("SomethingNew")), ErrorKind::Other);
+        assert_eq!(delete_code_kind(None), ErrorKind::Other);
+    }
+
+    /// No failure is reported as `Interrupted` any more: by convention that means
+    /// "just retry", which a denied key does not deserve.
+    #[test]
+    fn nothing_maps_to_interrupted() {
+        for status in 100u16..600 {
+            assert_ne!(status_kind(Some(status)), ErrorKind::Interrupted);
+        }
+        for code in ["AccessDenied", "SlowDown", "InternalError", "NoSuchKey", "?"] {
+            assert_ne!(delete_code_kind(Some(code)), ErrorKind::Interrupted);
         }
     }
 
