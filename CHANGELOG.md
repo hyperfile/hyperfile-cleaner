@@ -91,7 +91,7 @@ tracks the `hyperfile` release this speaks to.
   - **With a foreign key** (a WAL-shaped object under the prefix): `report` counts
     it, `compact` refuses with `InvalidInput`, and runs once
     `allow_foreign_keys` is set.
-  - **Sparse, in four-block batches**: 31 blocks rewritten across 9 checkpoints,
+  - **Sparse, in four-block batches**: 31 blocks rewritten across 8 checkpoints,
     which is the batch loop firing mid-sweep rather than only at the tail. Block
     states are identical before and after — `Zero` stayed `Zero` and `Unmapped`
     stayed `Unmapped` — so an explicit zero block did not start costing storage

@@ -218,7 +218,13 @@ pub struct CompactOutcome {
     pub bytes_rewritten: u64,
     /// The selected objects' stored bytes — what `prune` can now reclaim.
     pub bytes_freed: u64,
-    /// Checkpoints published, one per batch, plus one if the times were restored.
+    /// Checkpoints published: one per batch, and that is how far the container's
+    /// latest checkpoint number advanced.
+    ///
+    /// Restoring the timestamps is not counted because it is not one. A flush
+    /// with nothing dirty but the inode's attributes writes the inode object only
+    /// and allocates no checkpoint number, so the restore costs a second inode
+    /// write and moves `last_cno` not at all.
     pub checkpoints: usize,
     pub dry_run: bool,
 }
@@ -350,12 +356,11 @@ impl S3Cleaner {
 
         // Put the timestamps back even after a failure: the batches that landed
         // moved mtime, and the ones that did not are not a reason to leave it
-        // moved. This publishes a checkpoint of its own.
-        if let Some(stat) = saved {
-            match file.fs_setattr(&stat).await {
-                Ok(_) => outcome.checkpoints += 1,
-                Err(e) => warn!("compact: could not restore timestamps: {}", e),
-            }
+        // moved. Only the inode object is rewritten: no segment, no new number.
+        if let Some(stat) = saved
+            && let Err(e) = file.fs_setattr(&stat).await
+        {
+            warn!("compact: could not restore timestamps: {}", e);
         }
         let _ = file.fs_release().await;
         result?;
