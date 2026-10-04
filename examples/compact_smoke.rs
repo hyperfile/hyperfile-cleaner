@@ -13,7 +13,9 @@ use std::io::Result;
 use aws_sdk_s3::Client;
 use hyperfile::file::flags::FileFlags;
 use hyperfile::file::hyper::Hyper;
+use hyperfile::config::{HyperFileMetaConfig, HyperFileRuntimeConfig};
 use hyperfile::file::mode::FileMode;
+use hyperfile::meta_format::BlockPtrFormat;
 use hyperfile_cleaner::compact::CompactOptions;
 use hyperfile_cleaner::{Cleaner, s3::S3Cleaner};
 
@@ -37,6 +39,16 @@ async fn verify_block(client: &Client, uri: &str, idx: usize, want: u8) -> Resul
         "block {} reads {:#x}, wanted {:#x}", idx, buf[0], want);
     let _ = file.fs_release().await;
     Ok(())
+}
+
+/// `(content_cno, last_cno)` as a consumer that does not open the file sees them.
+async fn cnos(client: &Client, uri: &str) -> Result<(u64, u64)> {
+    let content = Hyper::fs_content_cno_fast(client, uri).await?;
+    let file = Hyper::fs_open(client, uri, FileFlags::rdonly()).await?;
+    let opened = file.fs_content_cno()?;
+    let last = file.fs_last_cno();
+    assert_eq!(content, opened, "the fast read and an opened file must agree");
+    Ok((content, last))
 }
 
 /// 64 blocks, one flush each.
@@ -66,11 +78,21 @@ async fn scattered(client: &Client, uri: &str) -> Result<()> {
     assert_eq!(dry.selected.len(), cand, "a dry run must agree with the estimate");
     assert_eq!(dry.bytes_freed, freed);
 
+    let (content_before, last_before) = cnos(client, uri).await?;
     let out = cleaner.compact(1, 0, &CompactOptions::default()).await?;
+    let (content_after, last_after) = cnos(client, uri).await?;
     println!("compacted: {} block(s), {} bytes, in {} checkpoint(s); freed {} bytes",
         out.blocks_rewritten, out.bytes_rewritten, out.checkpoints, out.bytes_freed);
+    println!("last_cno {} -> {}, content_cno {} -> {}",
+        last_before, last_after, content_before, content_after);
     assert!(out.still_referenced.is_empty(),
         "selected objects should hold nothing live afterwards: {:?}", out.still_referenced);
+    assert_eq!(out.checkpoints, 1, "a pass is one publish");
+    assert_eq!(last_after, last_before + 1, "last_cno moves by exactly one");
+    assert_eq!(content_after, content_before, "a compaction is not a change of content");
+    assert!(!out.content_moved());
+    assert_eq!((out.content_cno_before, out.content_cno_after), (content_before, content_after));
+    assert!(cleaner.report(1, 0).await?.latest_compacted, "the report should say so");
 
     // Every block must still read as itself.
     for idx in [0usize, 1, 31, 62, 63] {
@@ -148,14 +170,19 @@ async fn mostly_dead(client: &Client, uri: &str) -> Result<()> {
     assert_eq!(out.blocks_rewritten, survivors);
     assert!(out.still_referenced.is_empty(), "got {:?}", out.still_referenced);
 
-    // A compaction changes no content, so mtime must not move. ctime does:
-    // hyperfile advances it on any attribute update and it is not settable.
+    // Relocation touches neither timestamp, so nothing has to be put back and
+    // neither moves at all.
     let after_stat = Hyper::fs_getattr_fast(client, uri).await?;
     assert_eq!((after_stat.st_mtime, after_stat.st_mtime_nsec),
         (before_stat.st_mtime, before_stat.st_mtime_nsec),
         "mtime moved: {} -> {}", before_stat.st_mtime, after_stat.st_mtime);
-    assert!(after_stat.st_ctime >= before_stat.st_ctime, "ctime went backwards");
-    println!("mtime preserved ({}), ctime now {}", after_stat.st_mtime, after_stat.st_ctime);
+    assert_eq!((after_stat.st_ctime, after_stat.st_ctime_nsec),
+        (before_stat.st_ctime, before_stat.st_ctime_nsec),
+        "ctime moved: {} -> {}", before_stat.st_ctime, after_stat.st_ctime);
+    assert!(!out.content_moved(), "content_cno moved {} -> {}",
+        out.content_cno_before, out.content_cno_after);
+    println!("mtime and ctime unchanged ({} / {}), content_cno {}",
+        after_stat.st_mtime, after_stat.st_ctime, out.content_cno_after);
 
     cleaner.prune(1, 0).await?;
     let after = cleaner.report(1, 0).await?;
@@ -224,14 +251,14 @@ async fn refuses_a_possible_log(client: &Client, uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// A sparse file, compacted in batches of four blocks.
+/// A sparse file, relocated four blocks at a time.
 ///
-/// Two things nothing else here reaches: the batch loop firing mid-sweep rather
-/// than only at the tail, and what compaction must not do to a hole. Rewriting a
-/// hole would make a sparse file dense, and rewriting an explicit zero block —
-/// which occupies no storage — would start costing storage for the same read.
+/// Two things nothing else here reaches: many `fs_relocate` calls ending in one
+/// publish, and what compaction must not do to a hole. Rewriting a hole would
+/// make a sparse file dense, and rewriting an explicit zero block — which
+/// occupies no storage — would start costing storage for the same read.
 async fn sparse_in_small_batches(client: &Client, uri: &str) -> Result<()> {
-    println!("=== sparse file, four-block batches");
+    println!("=== sparse file, relocated four blocks at a time");
     let _ = Hyper::fs_unlink(client, uri).await;
     let mut file = Hyper::fs_create(
         client, uri, FileFlags::rdwr(), FileMode::default_file()).await?;
@@ -251,14 +278,14 @@ async fn sparse_in_small_batches(client: &Client, uri: &str) -> Result<()> {
 
     let cleaner = S3Cleaner::with_client(client, uri).await?;
     let out = cleaner.compact(1, 0, &CompactOptions {
-        batch_bytes: 4 * BS, ..Default::default()
+        relocate_chunk_bytes: 4 * BS, ..Default::default()
     }).await?;
     println!("compacted: {} block(s) in {} checkpoint(s)",
         out.blocks_rewritten, out.checkpoints);
-    assert!(out.checkpoints > 3,
-        "four-block batches over {} blocks should publish several checkpoints, got {}",
-        out.blocks_rewritten, out.checkpoints);
+    assert_eq!(out.checkpoints, 1, "however many relocate calls, a pass is one publish");
+    assert!(out.blocks_rewritten > 4, "enough blocks for several chunks");
     assert!(out.still_referenced.is_empty(), "got {:?}", out.still_referenced);
+    assert!(!out.content_moved());
 
     let states_after = block_states(client, uri, &[0, 8, 500, 1000]).await?;
     println!("states after : {:?}", states_after);
@@ -284,6 +311,117 @@ async fn block_states(client: &Client, uri: &str, indices: &[u64]) -> Result<Vec
     Ok(out)
 }
 
+/// A pass that leaves work behind, then the next one.
+///
+/// The mark that keeps `content_cno` still holds for one checkpoint, so a second
+/// pass straight after the first would move it. That pass is refused by default,
+/// runs when asked to, and then does move `content_cno`, exactly as documented.
+/// A write in between clears the mark and the next pass needs no permission.
+async fn consecutive_passes(client: &Client, uri: &str) -> Result<()> {
+    println!("=== consecutive passes");
+    let _ = Hyper::fs_unlink(client, uri).await;
+    let mut file = Hyper::fs_create(
+        client, uri, FileFlags::rdwr(), FileMode::default_file()).await?;
+    for idx in 0..48usize {
+        let _ = file.fs_write(idx * BS, &vec![idx as u8; BS]).await?;
+        let _ = file.fs_flush().await?;
+    }
+    let _ = file.fs_release().await?;
+    let cleaner = S3Cleaner::with_client(client, uri).await?;
+
+    // A budget of 16 blocks leaves most of the 47 candidates for later.
+    let small = CompactOptions { max_pass_bytes: 16 * BS as u64, ..Default::default() };
+    let first = cleaner.compact(1, 0, &small).await?;
+    println!("first : {} block(s), more remaining {}, content_cno {} -> {}",
+        first.blocks_rewritten, first.more_remaining,
+        first.content_cno_before, first.content_cno_after);
+    assert_eq!(first.blocks_rewritten, 16);
+    assert!(first.more_remaining);
+    assert!(!first.content_moved());
+
+    let e = cleaner.compact(1, 0, &small).await
+        .expect_err("a pass straight after a pass must be refused");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    println!("second: refused ({})", e.to_string().split(':').next().unwrap_or(""));
+
+    let forced = cleaner.compact(1, 0, &CompactOptions {
+        allow_consecutive: true, ..small.clone()
+    }).await?;
+    println!("forced: {} block(s), content_cno {} -> {}",
+        forced.blocks_rewritten, forced.content_cno_before, forced.content_cno_after);
+    assert!(forced.blocks_rewritten > 0);
+    assert!(forced.content_moved(),
+        "the documented cost of a second pass in a row is one apparent change");
+
+    // A real change clears the mark: content_cno moves, and the next pass is
+    // allowed again and keeps it.
+    let (content_before_write, _) = cnos(client, uri).await?;
+    let mut file = Hyper::fs_open(client, uri, FileFlags::rdwr()).await?;
+    let _ = file.fs_write(0, &vec![0xEEu8; BS]).await?;
+    let _ = file.fs_flush().await?;
+    let _ = file.fs_release().await?;
+    let (content_after_write, _) = cnos(client, uri).await?;
+    println!("write : content_cno {} -> {}", content_before_write, content_after_write);
+    assert!(content_after_write > content_before_write, "a write is a change of content");
+    assert!(!cleaner.report(1, 0).await?.latest_compacted);
+
+    let third = cleaner.compact(1, 0, &small).await?;
+    println!("third : {} block(s), content_cno {} -> {}",
+        third.blocks_rewritten, third.content_cno_before, third.content_cno_after);
+    assert!(third.blocks_rewritten > 0);
+    assert!(!third.content_moved());
+
+    cleaner.prune(1, 0).await?;
+    verify_block(client, uri, 0, 0xEE).await?;
+    for idx in [1usize, 15, 16, 30, 47] {
+        verify_block(client, uri, idx, idx as u8).await?;
+    }
+    let _ = Hyper::fs_unlink(client, uri).await;
+    Ok(())
+}
+
+/// A container in an unparted format, where a checkpoint is one object.
+///
+/// The pass has to fit one object, which the parted format does not need; the
+/// rest of the mechanism is the same. Until this case, compaction had only ever
+/// run on parted containers.
+async fn unparted(client: &Client, uri: &str) -> Result<()> {
+    println!("=== unparted (MicroGroup) container");
+    let _ = Hyper::fs_unlink(client, uri).await;
+    let meta = HyperFileMetaConfig::new(56, 4096, 4096, BlockPtrFormat::MicroGroup);
+    let rt = HyperFileRuntimeConfig::default();
+    let mut file = Hyper::fs_create_opt(
+        client, uri, FileFlags::rdwr(), FileMode::default_file(), &meta, &rt).await?;
+    for idx in 0..32usize {
+        let _ = file.fs_write(idx * BS, &vec![idx as u8; BS]).await?;
+        let _ = file.fs_flush().await?;
+    }
+    let _ = file.fs_release().await?;
+
+    let cleaner = S3Cleaner::with_client(client, uri).await?;
+    let before = cleaner.report(1, 0).await?;
+    assert!(before.objects.iter().all(|o| o.segid.part_id().is_none()),
+        "an unparted container's objects carry no part");
+    let out = cleaner.compact(1, 0, &CompactOptions::default()).await?;
+    println!("compacted: {} block(s) in {} checkpoint(s), content_cno {} -> {}",
+        out.blocks_rewritten, out.checkpoints, out.content_cno_before, out.content_cno_after);
+    assert_eq!(out.blocks_rewritten, 31);
+    assert_eq!(out.checkpoints, 1);
+    assert!(!out.content_moved());
+    assert!(out.still_referenced.is_empty(), "got {:?}", out.still_referenced);
+
+    cleaner.prune(1, 0).await?;
+    let after = cleaner.report(1, 0).await?;
+    println!("pruned: {} objects (was {})", after.objects.len(), before.objects.len());
+    assert_eq!(after.dead(), (0, 0));
+    assert!(after.objects.len() <= 2);
+    for idx in [0usize, 1, 16, 31] {
+        verify_block(client, uri, idx, idx as u8).await?;
+    }
+    let _ = Hyper::fs_unlink(client, uri).await;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -296,6 +434,8 @@ async fn main() -> Result<()> {
     mostly_dead(&client, &format!("{}/mostly-dead", uri)).await?;
     refuses_a_possible_log(&client, &format!("{}/with-log", uri)).await?;
     sparse_in_small_batches(&client, &format!("{}/sparse", uri)).await?;
+    consecutive_passes(&client, &format!("{}/consecutive", uri)).await?;
+    unparted(&client, &format!("{}/unparted", uri)).await?;
     println!("OK");
     Ok(())
 }

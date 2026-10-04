@@ -42,8 +42,8 @@ Two more operations, on `S3Cleaner` itself:
   could be given back: `dead()` is `prune`'s work, `compactable(ratio)`
   estimates what a rewrite would cost and free.
 - **`compact(low, high, &opts)`** — rewrites the live blocks of objects
-  at or below `max_live_ratio`, one checkpoint per batch. Deletes
-  nothing; `prune` does that afterwards.
+  at or below `max_live_ratio`, as one checkpoint. Deletes nothing;
+  `prune` does that afterwards.
 
 ```rust,no_run
 use hyperfile_cleaner::{Cleaner, compact::CompactOptions, s3::S3Cleaner};
@@ -55,18 +55,29 @@ let report = cleaner.report(1, 0).await?;
 let (objects, rewrite, freed) = report.compactable(0.5);
 println!("{objects} objects: rewrite {rewrite} bytes to free {freed}");
 
-cleaner.compact(1, 0, &CompactOptions::default()).await?;
+let out = cleaner.compact(1, 0, &CompactOptions::default()).await?;
+assert!(!out.content_moved());
 cleaner.prune(1, 0).await?;
 # Ok(())
 # }
 ```
 
-The rewrite is `hyperfile`'s, not this crate's: `fs_read_ahead` warms
-a run of blocks with the read path's own coalescing, `fs_block_mut`
-marks them dirty without changing their contents, and the flush writes
-the dirty set — sorted by block index and packed — as one object.
-Holes and explicit zero blocks are left alone, so a sparse file stays
-sparse.
+The rewrite is `hyperfile`'s, not this crate's: `fs_relocate` marks the
+blocks to be rewritten with their current bytes, reading them with the
+read path's own coalescing, and one flush writes them sorted by block
+index and packed. Holes and explicit zero blocks are left alone, so a
+sparse file stays sparse, and neither `mtime` nor `ctime` moves.
+
+**A compaction is not a change of content.** It has to publish a new
+checkpoint, so `last_cno` advances by one. `hyperfile` marks that
+checkpoint `FLAG_COMPACTED`, and `fs_content_cno()` stays where it was:
+that is the number to compare when asking whether a file changed, not
+`last_cno`. The mark holds for one checkpoint, so two passes in a row
+would move `content_cno` on the second; `compact` refuses to start on a
+checkpoint that is already marked unless `allow_consecutive` is set.
+`CompactOutcome::content_moved()` says whether consumers will see the
+pass as a change — they will when an earlier flush failed and gave its
+number up, which the mark does not span.
 
 **Compaction requires exclusive write access.** It is a writer, and it
 writes bytes it read earlier, so it runs with
@@ -110,6 +121,12 @@ For tools that already have a configured `aws_sdk_s3::Client`, use
   and a container holding a WAL is refused unless the caller overrides
   it. Compacting a container a writer is actively publishing to needs a
   background task inside `hyperfile`, not a separate process.
+- A pass holds everything it relocates dirty in memory until its one
+  flush, bounded by `max_pass_bytes` (512 MiB by default). A container
+  with more to rewrite takes several passes, and each pass after the
+  first in a row moves `content_cno` once.
+- An inline file or a device node has no segments; `collect`, `prune`,
+  `report` and `compact` refuse them.
 - An object holding a live metadata node is not a compaction candidate.
   A node is relocated when the flush rewrites it, which needs something
   under it dirtied, and which keys a node covers is not visible from

@@ -9,6 +9,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.0] - 2026-10-04
+
+Follows `hyperfile 0.10.0`. A compaction is no longer seen as a change of content:
+it publishes one checkpoint, `hyperfile` marks it `FLAG_COMPACTED`, and
+`fs_content_cno()` stays where it was. The rewrite moves to `hyperfile`'s new
+`fs_relocate`, so it touches neither `mtime` nor `ctime`.
+
+### Breaking changes
+
+- **`hyperfile` requirement moves from `0.9` to `0.10`.**
+- **`CompactOptions` changed shape.** `batch_bytes` and `preserve_times` are gone;
+  `max_bytes_rewritten` is now `max_pass_bytes`, defaulting to 512 MiB rather than
+  unlimited; `relocate_chunk_bytes` and `allow_consecutive` are new. A literal built
+  with `..Default::default()` only needs the renamed field.
+- **A pass is one checkpoint, not one per batch.** `CompactOutcome::checkpoints` is
+  1 for a pass that rewrote anything and 0 otherwise. A container with more to
+  rewrite than `max_pass_bytes` takes several passes; `more_remaining` says so.
+- **`compact` refuses to run on a checkpoint that is already a compaction**, with
+  `InvalidInput`, unless `allow_consecutive` is set. See below for why.
+- **`collect`, `prune`, `report` and `compact` refuse an inline file or a device
+  node** with `InvalidInput`. Their `i_last_cno` holds inline data or `rdev`, not a
+  checkpoint number. Nothing was deleted on the strength of it before — the summary
+  that number named was not found — but the error pointed at a missing segment.
+
+### Why one pass is one checkpoint
+
+`FLAG_COMPACTED` is set only when a publish's number directly follows the previous
+one, so it holds for exactly one checkpoint, and `content_cno` is `last_cno − 1`
+while it is set. A pass that published once per batch, as 0.9 did, would be marked
+on its first checkpoint and move `content_cno` on every one after.
+
+So the pass relocates everything it selected and flushes once. `fs_relocate` does not
+check the dirty thresholds itself, and the compacting handle sets them above the pass
+so nothing publishes partway. What that costs is memory: the whole pass is held dirty
+until the flush, which `max_pass_bytes` bounds. `relocate_chunk_bytes` bounds the
+second copy `fs_relocate` holds while it reads.
+
+For the same reason a second pass straight after a first moves `content_cno` once —
+its predecessor is marked, so the mark cannot cover both. That is refused by default;
+a write in between clears the mark and the next pass is allowed again.
+`Report::latest_compacted` says which case a container is in.
+
+### Changed
+
+- **The rewrite is `fs_relocate`**, replacing `fs_read_ahead` + `fs_block_mut` and the
+  `fs_setattr` that put the timestamps back. It reads with the read path's
+  coalescing, skips holes, explicit zero blocks and blocks already dirty, and touches
+  neither `mtime`, `ctime` nor the read cache. `blocks_rewritten` is the count it
+  returns — what was marked, not what was planned.
+- **`CompactOutcome` reports `content_cno_before` and `content_cno_after`**, and
+  `content_moved()` compares them. Equal is the ordinary case. They differ when the
+  publish could not be marked: `allow_consecutive` was used, or an earlier flush
+  failed and gave its number up, so this publish's number did not follow the last
+  one.
+- **A pass on a container that is not parted is capped at three quarters of one
+  object.** Under any other format a checkpoint is one object, and `hyperfile`
+  refuses a flush larger than that. Parted containers split a large checkpoint into
+  data parts, so only `max_pass_bytes` applies to them.
+- **Objects are taken whole and cheapest first, and the selection stops at the first
+  that does not fit** rather than skipping to a smaller one.
+
+### Verified
+
+Against real S3 on `hyperfile 0.10.0`, `examples/compact_smoke`, six shapes:
+
+- **Scattered** (64 blocks, one flush each): `last_cno` 64 → 65 in one checkpoint and
+  `content_cno` 64 → 64, both from `fs_content_cno_fast` and from an opened file;
+  reading the file went from 64 requests to 2; `report` then says `latest_compacted`.
+- **Mostly dead** (a 4,239,360-byte checkpoint 1.5% live): 65,536 bytes rewritten
+  recovered 4,145,152. `mtime` **and** `ctime` both unchanged.
+- **Foreign key**: refused, then allowed.
+- **Sparse, relocated four blocks at a time**: 31 blocks over eight `fs_relocate`
+  calls, one checkpoint; `Zero` stayed `Zero`, `Unmapped` stayed `Unmapped`.
+- **Consecutive passes** (48 checkpoints, a 16-block budget): the first pass
+  relocated 16 with `more_remaining` and `content_cno` 48 → 48; the second was
+  refused; forced with `allow_consecutive` it moved `content_cno` 48 → 49, as
+  documented; a write then moved it 49 → 51 and cleared the mark; the third pass
+  needed no permission and kept it at 51.
+- **Unparted** (`MicroGroup`, 32 checkpoints): 31 blocks in one checkpoint,
+  `content_cno` 32 → 32, 32 objects down to 2 after `prune`. The first time
+  compaction has run on a container that is not parted; 0.7.1 and 0.9.0 listed it as
+  untested.
+
+Every shape reads its blocks back correct. `parted_smoke`, `smoke` and `split_smoke`
+re-run with answers unchanged. 24 unit tests and the doctest; `clippy --all-targets`
+clean with `-D warnings`, checked by exit status.
+
+Still argued from the code rather than tested: the case where an earlier failed flush
+leaves this pass's number not following the last publish, which needs a flush to fail
+on storage; and the `FailFast` path under a concurrent publish.
+
 ## [0.9.0] - 2026-10-04
 
 Follows `hyperfile 0.9.1` and `btree-ondisk 0.20.1`. No source change was needed; what

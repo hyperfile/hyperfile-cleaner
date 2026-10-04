@@ -297,7 +297,9 @@ impl S3Cleaner {
         // container's pointer format lives in the inode, and it decides both
         // which object holds a checkpoint's summary and how a pointer decodes.
         let (raw_inode, inode_state) = self.load_raw_inode().await?;
+        refuse_unsegmented(&raw_inode)?;
         let fmt = container_ptr_format(&raw_inode);
+        let latest_compacted = raw_inode.is_compacted();
         let high_cno = if high == 0 {
             let inode = Inode::from_raw(&raw_inode, inode_state);
             inode.get_last_cno()
@@ -358,6 +360,7 @@ impl S3Cleaner {
         Ok(ContainerView {
             low,
             high_cno,
+            latest_compacted,
             fmt,
             high_summary,
             data_block_size,
@@ -413,6 +416,9 @@ pub(crate) struct ObjectListing {
 pub(crate) struct ContainerView {
     pub(crate) low: Cno,
     pub(crate) high_cno: Cno,
+    /// Whether the published inode marks its checkpoint as a compaction
+    /// (`InodeRaw::FLAG_COMPACTED`): it moved blocks and changed no content.
+    pub(crate) latest_compacted: bool,
     pub(crate) fmt: BlockPtrFormat,
     pub(crate) high_summary: SegmentId,
     pub(crate) data_block_size: usize,
@@ -436,6 +442,38 @@ impl ContainerView {
     /// Which object a live location is in.
     pub(crate) fn object_of(&self, blkptr: &BlockPtr) -> SegmentId {
         BlockPtrFormat::decode(blkptr, &self.fmt).0
+    }
+}
+
+/// `S_IFMT` and the two device types, as the inode stores its mode. POSIX fixes
+/// these values, so they are the same on every host.
+const S_IFMT: u32 = 0o170000;
+const S_IFCHR: u32 = 0o020000;
+const S_IFBLK: u32 = 0o060000;
+
+/// Refuse an inode whose checkpoint fields do not hold checkpoint numbers.
+///
+/// An inline file keeps its data in the inode's tail, over `i_last_seq`,
+/// `i_last_cno` and the bmap root; a device node keeps its `rdev` in
+/// `i_last_cno`. Read as a checkpoint number either is whatever the bytes
+/// happen to be. Nothing would be deleted on the strength of it — the summary
+/// it named would not be found — but the error would point at a missing segment
+/// rather than at what is actually wrong.
+fn refuse_unsegmented(raw: &InodeRaw) -> Result<()> {
+    let fmt = raw.i_mode & S_IFMT;
+    let what = if raw.is_inline() {
+        Some("an inline file, whose data lives in the inode")
+    } else if fmt == S_IFCHR || fmt == S_IFBLK {
+        Some("a device node, which stores rdev where a checkpoint number would be")
+    } else {
+        None
+    };
+    match what {
+        Some(what) => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("this container is {}: it has no segments to collect, prune or compact", what),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -657,6 +695,29 @@ mod tests {
                 e.to_string().contains(&format!("[{}, {}]", low, high)),
                 "error should name the range, got {:?}", e.to_string(),
             );
+        }
+    }
+
+    /// An inline file's checkpoint fields hold its data, and a device node's hold
+    /// its rdev. Neither is a checkpoint number, so the walk refuses up front
+    /// rather than looking for a segment the bytes happen to name.
+    #[test]
+    fn an_inode_without_segments_is_refused() {
+        let mut inline = InodeRaw { i_mode: 0o100644, ..Default::default() };
+        inline.set_inline(b"hello");
+        let e = refuse_unsegmented(&inline).expect_err("inline must be refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("inline"), "{}", e);
+
+        for mode in [0o020644u32, 0o060644] {
+            let dev = InodeRaw { i_mode: mode, ..Default::default() };
+            let e = refuse_unsegmented(&dev).expect_err("a device node must be refused");
+            assert!(e.to_string().contains("device"), "{}", e);
+        }
+
+        for mode in [0o100644u32, 0o040755, 0o120777] {
+            let ok = InodeRaw { i_mode: mode, ..Default::default() };
+            assert!(refuse_unsegmented(&ok).is_ok(), "mode {:o} has segments", mode);
         }
     }
 
