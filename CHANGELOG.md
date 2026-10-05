@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.3] - 2026-10-05
+
+Follows `hyperfile 0.10.3`, which turns input it does not expect into an error
+instead of a panic or a hang.
+
+### Changed
+
+- **`hyperfile` requirement moves to `0.10.3`.** A malformed staging URI is now
+  `InvalidInput` there rather than a panic, and a HeadObject without a usable `Date`
+  or `Last-Modified` is `InvalidData` rather than a panic or an open that never
+  returns. The second matters to `compact`, which opens the container writable and
+  so goes through the check on a checkpoint no inode points at yet; it is seen only
+  behind a proxy or with an S3-compatible store, since S3 always sends both headers.
+
+### Fixed
+
+- **`S3Cleaner::with_client` turned `s3://` into `s3:/`** by stripping a trailing
+  slash unconditionally, and then refused it for not starting with `s3://` — the
+  wrong reason. The trim now leaves a slash that belongs to the scheme, the same rule
+  `hyperfile 0.10.3` adopted in `StagingConfig::new_s3_uri`, and `s3://` is refused as
+  an incomplete URI. It was `InvalidInput` either way; only the message changes.
+
+### Verified
+
+- Bad root URIs through `S3Cleaner::with_client` against real S3: `""`,
+  `http://…`, `s3://`, `s3:///x`, `s3://b` and `s3://b/` are each `InvalidInput`
+  naming the reason, and a container that does not exist is `NotFound`. Nothing
+  panics or hangs.
+- 25 unit tests, one new for the trim, and the doctest; `clippy --all-targets`
+  clean with `-D warnings`, by exit status; `cargo publish --dry-run`.
+- Against real S3: `compact_smoke`, `parted_smoke`, `smoke` and `split_smoke`.
+
 ## [0.10.2] - 2026-10-04
 
 Error classification is `hyperfile`'s own, called rather than copied.
