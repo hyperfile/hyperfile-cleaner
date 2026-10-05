@@ -53,6 +53,17 @@
 //! # }
 //! ```
 
+#[cfg(all(feature = "blocking", feature = "reactor"))]
+compile_error!(
+    "features `blocking` and `reactor` are mutually exclusive: they select \
+     hyperfile builds that link btree-ondisk `rc` and `arc` respectively. \
+     For `reactor`, set `default-features = false`."
+);
+#[cfg(not(any(feature = "blocking", feature = "reactor")))]
+compile_error!(
+    "select a hyperfile build: feature `blocking` (the default) or `reactor`"
+);
+
 use std::io::Result;
 use hyperfile::{Cno, SegmentId};
 

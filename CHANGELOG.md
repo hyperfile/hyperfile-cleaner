@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.4] - 2026-10-05
+
+The cleaner follows whichever `hyperfile` build the caller selects, so it can share a
+binary with `hyperfile`'s default build. And `compact` finishes on a file whose data
+is far apart, where before it ran without end.
+
+### Added
+
+- **Features `blocking` and `reactor` select the `hyperfile` build.** `blocking`,
+  `hyperfile`'s direct-API build with `btree-ondisk` `rc`, stays the default, so
+  nothing changes for existing users. `reactor` is `hyperfile`'s own default build —
+  `btree-ondisk` `arc` and the batched index loader — and is what a crate that also
+  depends on `hyperfile` with its default features needs:
+
+  ```toml
+  hyperfile-cleaner = { version = "0.10", default-features = false, features = ["reactor"] }
+  ```
+
+  Until now both were fixed to `blocking`/`rc`, and linking the cleaner next to a
+  default `hyperfile` failed in `btree-ondisk`, whose `rc` and `arc` cannot be
+  enabled together. Selecting both builds, or neither, still fails to build; the
+  error comes from `btree-ondisk`, which is compiled first. Requested by
+  hyperbox-zfs.
+
+### Fixed
+
+- **`compact` never finished on a file with blocks far past its other data.** It
+  found which blocks lived in the selected objects by asking `block_placement` about
+  every index from 0 to EOF. A consumer that keeps its own state at `1 << 56` has
+  2^44 indices below it, so the pass ran until it was killed — over 400 s in the
+  probe that found it, with no end in sight.
+
+  The bmap walk that `report` and `compact` already do now also records where mapped
+  blocks are, as windows found with `seek_key`, which skips a hole in O(log n) and,
+  with every node already loaded by the walk, costs no request. `compact` asks only
+  about those windows. The same file now compacts in under a second, and its far
+  blocks are moved like any others.
+
+  Done on the walk's own map rather than through `Hyper::fs_seek_data`, which would
+  have worked but holds a `&Hyper` across an await.
+
+### Notes
+
+- **Which futures are `Send`.** `collect`, `prune` and `report` are `Send` in both
+  builds. `compact` is not, in either: under `blocking` the `Hyper` it drives holds
+  `Rc` nodes, and under `reactor` a `Hyper` is not `Sync` while its `fs_flush` holds
+  a `&Hyper` across an await. Await it where it is created rather than spawning it.
+  Checked by assertion in both builds.
+- **Nothing the compacting handle's runtime configuration decides is stored.** A
+  writer that uses different settings — multipart uploads, large dirty thresholds —
+  opens the container after a compaction as before.
+
+### Verified
+
+- `examples/far_smoke` (new), against real S3: seven low blocks and three at
+  `1 << 56`, each its own checkpoint. `compact` rewrites 10 blocks in about 0.8 s
+  with `content_cno` unchanged; the two far blocks that were candidates land in one
+  object, the newest checkpoint's stays where it was, and all three read back.
+- Both builds, each: 25 unit tests and the doctest; `clippy --all-targets` clean
+  with `-D warnings`, by exit status; and against real S3 `far_smoke`,
+  `compact_smoke` in all six shapes, `split_smoke`, `parted_smoke` and `smoke`, with
+  the same numbers in both.
+- A consumer crate with the cleaner on `reactor`, `hyperfile = "=0.10.3"` with its
+  default features, and `btree-ondisk` with `arc`, `value-check` and `mt` — the set
+  hyperbox-zfs uses — builds, and `btree-ondisk` resolves to `arc` alone.
+- `cargo publish --dry-run`, for both builds.
+
 ## [0.10.3] - 2026-10-05
 
 Follows `hyperfile 0.10.3`, which turns input it does not expect into an error

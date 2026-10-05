@@ -1,6 +1,6 @@
 [package]
 name = "hyperfile-cleaner"
-version = "0.10.3"
+version = "0.10.4"
 edition = "2024"
 description = "Segments cleaner implementation for Hyperfile"
 authors = ["Dai Yiyang"]
@@ -15,8 +15,23 @@ log = "0.4.27"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 aws-config = { version = "1.8.1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.96.0"
-btree-ondisk = { version = "0.20.1", default-features = false, features = ["rc", "tokio-runtime"] }
-hyperfile = { version = "0.10.3", default-features = false, features = ["blocking"] }
+# The `rc` / `arc` choice is not made here: it follows the hyperfile build
+# selected below, since a binary can hold only one of the two.
+btree-ondisk = { version = "0.20.1", default-features = false, features = ["tokio-runtime"] }
+hyperfile = { version = "0.10.3", default-features = false }
+
+[features]
+# Which hyperfile build to link against. Exactly one: hyperfile and btree-ondisk
+# both refuse the two together, and with neither btree-ondisk has no node type.
+#
+# `blocking` is hyperfile's direct-API build (btree-ondisk `rc`), and stays the
+# default so existing users are unaffected. `reactor` is hyperfile's own default
+# build (btree-ondisk `arc`, plus the batched index loader); pick it with
+# `default-features = false, features = ["reactor"]` to share a binary with a
+# consumer that uses hyperfile with its default features.
+default = ["blocking"]
+blocking = ["hyperfile/blocking"]
+reactor = ["hyperfile/reactor", "hyperfile/meta_loader_batch"]
 
 [dev-dependencies]
 env_logger = "0.11"

@@ -110,6 +110,28 @@ cleaner.prune(1, 0).await?;
 For tools that already have a configured `aws_sdk_s3::Client`, use
 `S3Cleaner::with_client(&client, root_uri)` instead of `new`.
 
+## Choosing the hyperfile build
+
+`hyperfile` comes in two builds that cannot share a binary: `blocking`, its
+direct-API build, and `reactor`, its default. They link `btree-ondisk` with `rc`
+and `arc` nodes respectively. This crate follows whichever is selected:
+
+```toml
+# default: hyperfile's `blocking` build
+hyperfile-cleaner = "0.10"
+
+# alongside a crate that uses hyperfile with its default features
+hyperfile-cleaner = { version = "0.10", default-features = false, features = ["reactor"] }
+```
+
+Selecting both, or neither, fails to build — in `btree-ondisk`, which is compiled
+first, so its error is the one shown.
+
+`collect`, `prune` and `report` return futures that are `Send` in both builds.
+`compact`'s is not, in either: it drives a `Hyper`, which under `blocking` holds
+`Rc` nodes and under `reactor` is not `Sync` while its `fs_flush` holds a `&Hyper`
+across an await. Await it where it is created rather than spawning it.
+
 ## Limitations
 
 - The cleaner does not coordinate with in-flight writers. It

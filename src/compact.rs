@@ -76,10 +76,6 @@ use hyperfile::meta_format::BlockPtrFormat;
 use hyperfile::staging::config::StagingConfig;
 use crate::s3::{ContainerView, S3Cleaner};
 
-/// How many blocks to ask `block_placement` about at a time. One entry per block
-/// comes back, so this bounds the answer rather than the work: the sweep covers
-/// the whole file either way.
-const PLACEMENT_CHUNK_BLOCKS: usize = 64 * 1024;
 
 /// How much of one stored object is still pointed into.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,19 +387,16 @@ impl S3Cleaner {
             return Ok(());
         }
         let bs = view.data_block_size;
-        let blocks_in_file = (file.fs_getattr()?.st_size as u64).div_ceil(bs as u64);
         let chunk_blocks = (opts.relocate_chunk_bytes / bs.max(1)).max(1);
 
         // Which blocks are in the selected objects. `block_placement` answers
         // exactly that, per index, from the live map — so it needs no agreement
-        // with a second reading of the container's layout. It is swept in chunks
-        // because the answer is one entry per block and a large file has a lot of
-        // them. Runs go to `fs_relocate` in index order, which is also the order
-        // the flush writes them in.
+        // with a second reading of the container's layout. It is asked only about
+        // the windows the walk found mapped blocks in, never about the holes
+        // between them. Runs go to `fs_relocate` in index order, which is also
+        // the order the flush writes them in.
         let mut pending: Vec<BlockIndex> = Vec::new();
-        let mut start: BlockIndex = 0;
-        while start < blocks_in_file {
-            let n = PLACEMENT_CHUNK_BLOCKS.min((blocks_in_file - start) as usize);
+        for (start, n) in view.live.windows.iter().copied() {
             let places = file.fs_block_placement(start, n).await?;
             for (i, place) in places.iter().enumerate() {
                 if let Some((segid, _)) = place
@@ -416,7 +409,6 @@ impl S3Cleaner {
                     }
                 }
             }
-            start += n as BlockIndex;
         }
         if !pending.is_empty() {
             outcome.blocks_rewritten += relocate_runs(file, &pending).await?;

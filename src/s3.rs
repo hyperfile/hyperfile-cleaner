@@ -137,7 +137,40 @@ impl S3Cleaner {
         };
         let all = on_staging(handle.block_on(bmap.collect_ptrs())?);
         let meta = on_staging(handle.block_on(bmap.collect_meta_ptrs())?);
-        Ok(LivePtrs { all, meta })
+
+        // Where in the file the mapped blocks are, as windows of at most
+        // `DATA_WINDOW_BLOCKS`. `compact` asks `block_placement` about these
+        // rather than about every index from 0 to EOF: a file can be sparse on a
+        // scale that sweep cannot cover — one with blocks at `1 << 56` has 2^44
+        // indices below them. `seek_key` skips a hole in O(log n), and the walk
+        // above has already loaded every node, so this costs no request.
+        //
+        // Done here, on the map this walk already holds, rather than through
+        // `Hyper::fs_seek_data` on the compacting handle: that takes `&self`,
+        // and holding a `&Hyper` across an await keeps a future from being
+        // `Send`, since a `Hyper` is not `Sync`.
+        let mut windows: Vec<(BlockIndex, usize)> = Vec::new();
+        let mut pos: BlockIndex = 0;
+        loop {
+            let key = match handle.block_on(bmap.seek_key(&pos)) {
+                Ok(key) => key,
+                Err(e) if e.kind() == ErrorKind::NotFound => break,
+                Err(e) => return Err(e),
+            };
+            match windows.last_mut() {
+                Some((start, n)) if *start + *n as BlockIndex == key
+                    && *n + DATA_WINDOW_BLOCKS <= 4 * DATA_WINDOW_BLOCKS =>
+                {
+                    *n += DATA_WINDOW_BLOCKS;
+                },
+                _ => windows.push((key, DATA_WINDOW_BLOCKS)),
+            }
+            match key.checked_add(DATA_WINDOW_BLOCKS as BlockIndex) {
+                Some(next) => pos = next,
+                None => break,
+            }
+        }
+        Ok(LivePtrs { all, meta, windows })
     }
 
     /// Every segment object that exists under the container's prefix, with its
@@ -407,7 +440,15 @@ impl S3Cleaner {
 pub(crate) struct LivePtrs {
     pub(crate) all: BTreeSet<BlockPtr>,
     pub(crate) meta: BTreeSet<BlockPtr>,
+    /// `(first, count)` ranges of block indices that together cover every
+    /// mapped block, ascending. They may also cover holes; they skip the large
+    /// ones.
+    pub(crate) windows: Vec<(BlockIndex, usize)>,
 }
+
+/// The granularity of [`LivePtrs::windows`]: a mapped block starts a window this
+/// long, and windows that touch are merged up to four of these.
+pub(crate) const DATA_WINDOW_BLOCKS: usize = 64 * 1024;
 
 /// What a listing of the container's prefix found.
 #[derive(Default)]
