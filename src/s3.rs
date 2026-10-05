@@ -66,7 +66,7 @@ impl S3Cleaner {
     ///
     /// Returns `InvalidInput` if `root_uri` is not a valid S3 URI.
     pub async fn with_client(client: &Client, root_uri: &str) -> Result<Self> {
-        let trimmed = root_uri.strip_suffix('/').unwrap_or(root_uri);
+        let trimmed = trim_root_uri(root_uri);
         let s3uri = S3Uri::parse(trimmed).map_err(|e| {
             Error::new(
                 ErrorKind::InvalidInput,
@@ -453,6 +453,18 @@ impl ContainerView {
     }
 }
 
+/// `root_uri` without one trailing `/`, unless that `/` is part of the scheme.
+///
+/// Stripping it unconditionally turned `s3://` into `s3:/`, which the parse then
+/// refused for not starting with `s3://` — the opposite of what was wrong with it.
+/// `hyperfile 0.10.3` fixed the same thing in `StagingConfig::new_s3_uri`.
+fn trim_root_uri(root_uri: &str) -> &str {
+    match root_uri.strip_suffix('/') {
+        Some(r) if !r.ends_with(":/") => r,
+        _ => root_uri,
+    }
+}
+
 /// `S_IFMT` and the two device types, as the inode stores its mode. POSIX fixes
 /// these values, so they are the same on every host.
 const S_IFMT: u32 = 0o170000;
@@ -704,6 +716,15 @@ mod tests {
                 "error should name the range, got {:?}", e.to_string(),
             );
         }
+    }
+
+    #[test]
+    fn a_trailing_slash_is_trimmed_but_not_the_schemes() {
+        assert_eq!(trim_root_uri("s3://b/k/"), "s3://b/k");
+        assert_eq!(trim_root_uri("s3://b/k"), "s3://b/k");
+        assert_eq!(trim_root_uri("s3://"), "s3://");
+        assert_eq!(trim_root_uri("S3://"), "S3://");
+        assert_eq!(trim_root_uri(""), "");
     }
 
     /// An inline file's checkpoint fields hold its data, and a device node's hold
