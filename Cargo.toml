@@ -1,6 +1,6 @@
 [package]
 name = "hyperfile-cleaner"
-version = "0.10.4"
+version = "0.10.5"
 edition = "2024"
 description = "Segments cleaner implementation for Hyperfile"
 authors = ["Dai Yiyang"]
@@ -18,7 +18,7 @@ aws-sdk-s3 = "1.96.0"
 # The `rc` / `arc` choice is not made here: it follows the hyperfile build
 # selected below, since a binary can hold only one of the two.
 btree-ondisk = { version = "0.20.1", default-features = false, features = ["tokio-runtime"] }
-hyperfile = { version = "0.10.3", default-features = false }
+hyperfile = { version = "0.10.4", default-features = false }
 
 [features]
 # Which hyperfile build to link against. Exactly one: hyperfile and btree-ondisk

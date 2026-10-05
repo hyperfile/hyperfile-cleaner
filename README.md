@@ -143,10 +143,19 @@ across an await. Await it where it is created rather than spawning it.
   and a container holding a WAL is refused unless the caller overrides
   it. Compacting a container a writer is actively publishing to needs a
   background task inside `hyperfile`, not a separate process.
-- A pass holds everything it relocates dirty in memory until its one
-  flush, bounded by `max_pass_bytes` (512 MiB by default). A container
-  with more to rewrite takes several passes, and each pass after the
-  first in a row moves `content_cno` once.
+- On a parted container a pass of any size is written out as partial
+  segments as it goes, so it holds no more than the dirty-data limits
+  in memory, and it is still one checkpoint. Where no partial can be
+  written — a container that is not parted, or partials turned off — a
+  pass holds everything it relocates until its one flush and is capped
+  at `UNBOUNDED_PASS_BYTES` (512 MiB). A container with more to rewrite
+  than one pass takes several, and each pass after the first in a row
+  moves `content_cno` once.
+- The handle that rewrites uses `CompactOptions::runtime` if given —
+  pass the configuration the container's writer uses, and compaction
+  writes objects of the same shape — and otherwise
+  `compaction_runtime_default()`, 64 MiB partials. Only
+  `flush_conflict_policy` is overridden, to `FailFast`.
 - An inline file or a device node has no segments; `collect`, `prune`,
   `report` and `compact` refuse them.
 - An object holding a live metadata node is not a compaction candidate.

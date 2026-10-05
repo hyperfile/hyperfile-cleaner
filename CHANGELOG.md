@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.10.5] - 2026-10-05
+
+A compaction pass on a parted container is no longer bounded by memory, and the
+caller decides the shape of what it writes.
+
+### Changed
+
+- **`hyperfile` requirement moves to `0.10.4`**, where `relocate` answers the
+  dirty-data limits as a write does: past them, on a parted container with partials
+  enabled, it writes a partial segment. Unlike a write it never publishes, so a pass
+  of any size is still one checkpoint, still marked `FLAG_COMPACTED`, and
+  `content_cno` stays where it was.
+- **`CompactOptions::max_pass_bytes` defaults to unlimited**, where it was 512 MiB.
+  On a parted container with partials enabled it is now only how much one pass
+  moves; memory is bounded by the dirty-data limits. Where no partial can be written
+  it is still capped: at `UNBOUNDED_PASS_BYTES` (512 MiB) with partials turned off,
+  and on a container that is not parted at three quarters of one object, now
+  reckoned from the caller's `segment_max_object_bytes` rather than the format's
+  ceiling.
+- **The compacting handle no longer raises the limits above the pass.** That was
+  how 0.10.0 kept a pass from publishing midway, and with `relocate` unable to
+  publish it is no longer needed.
+
+### Added
+
+- **`CompactOptions::runtime: Option<HyperFileRuntimeConfig>`**, the runtime
+  configuration of the handle that rewrites. Give the one the container's writer
+  uses — partial size, dirty-data limits, `segment_buffer_size`, multipart uploads,
+  read cache — and a compaction writes objects shaped like the writer's. Only
+  `flush_conflict_policy` is overridden, to `FailFast`: a compactor writes bytes it
+  read earlier, and retrying on a conflict would republish them over a newer write.
+  Requested by hyperbox-zfs.
+- **`compaction_runtime_default()`**, used when no configuration is given: 64 MiB
+  partials, an hour's flush interval so they are cut by size.
+- **`UNBOUNDED_PASS_BYTES`**, the cap on a pass that nothing can write out early.
+
+`CompactOptions` gained a field; a literal built with `..Default::default()` is
+unaffected.
+
+### Fixed
+
+- **A failed pass could publish part of itself.** On an error the compacting handle
+  was closed with `fs_release`, which flushes, so what the pass had marked so far
+  could be published under a pass reported as failed — and on a parted container,
+  since 0.10.4, that includes the partials it had written. The handle is now dropped
+  instead, which does not flush; partials it wrote sit above the published
+  checkpoint, where the next open steps past them and a later `prune` collects them.
+  Argued from the code: reaching it needs a pass to fail on storage.
+
+### Verified
+
+- `compact_smoke`, a new shape: 256 checkpoints holding 1 MiB live, compacted with a
+  caller's runtime of 128 KiB partials and relocated 64 KiB at a time. 255 blocks in
+  one checkpoint, `last_cno` 256 → 257, `content_cno` 256 → 256; the new checkpoint
+  is six objects, five of them partials, the largest 208,896 bytes — cut at the
+  caller's limits. The blocks read back after `prune`.
+- The six earlier `compact_smoke` shapes and `far_smoke`, `split_smoke`,
+  `parted_smoke` and `smoke`, against real S3, in both builds.
+- 26 unit tests, the pass cap now taking the runtime into account and a new one
+  checking a given runtime is kept but for the conflict policy; the doctest; `clippy
+  --all-targets` clean with `-D warnings` in both builds, by exit status; `cargo
+  publish --dry-run`.
+
 ## [0.10.4] - 2026-10-05
 
 The cleaner follows whichever `hyperfile` build the caller selects, so it can share a

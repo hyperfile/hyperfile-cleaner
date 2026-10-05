@@ -183,14 +183,29 @@ pub struct CompactOptions {
     /// Rewrite an object only if at most this much of it is still live. At `1.0`
     /// every live object is a candidate, which rewrites the whole container.
     pub max_live_ratio: f64,
-    /// The most live bytes one pass rewrites. A pass is one checkpoint, so this is
-    /// also what it holds dirty in memory until the flush — `fs_relocate` does not
-    /// write anything out on its own. Objects are taken whole and cheapest first
-    /// until the next would pass this; what is left waits for the next pass.
+    /// The most live bytes one pass rewrites. Objects are taken whole and
+    /// cheapest first until the next would pass this; what is left waits for the
+    /// next pass. Unlimited by default.
     ///
-    /// On a container that is not in the parted format a checkpoint is one object,
-    /// so a pass is further capped at what one object can hold.
+    /// On a parted container with partial segments enabled — the default for
+    /// both — this is only a size: `fs_relocate` writes the pass out as partials
+    /// once it crosses the dirty-data limits, so memory is bounded by those
+    /// limits whatever the pass. Where no partial can be written, everything the
+    /// pass relocates stays dirty until its one flush, so the pass is also capped
+    /// at [`UNBOUNDED_PASS_BYTES`]; and a container that is not parted writes a
+    /// checkpoint as one object, so its pass is capped at what one object holds.
     pub max_pass_bytes: u64,
+    /// The runtime configuration of the handle that does the rewrite: the size of
+    /// the partials a pass is written out as (`data_cache_dirty_min_bytes_to_part`
+    /// and the dirty-data limits), `segment_buffer_size`, the read cache,
+    /// multipart uploads. Give the one the container's writer uses, and what a
+    /// compaction writes is shaped like what the writer writes.
+    ///
+    /// `None` uses [`compaction_runtime_default`]. Either way the cleaner
+    /// overrides one field, `flush_conflict_policy`, to `FailFast`: a compactor
+    /// writes bytes it read earlier, and retrying on a conflict would republish
+    /// them over another writer's newer ones.
+    pub runtime: Option<HyperFileRuntimeConfig>,
     /// How many bytes of blocks to hand `fs_relocate` at once. It holds what it
     /// reads in a buffer of its own before the dirty cache takes it, so this bounds
     /// that second copy.
@@ -211,7 +226,8 @@ impl Default for CompactOptions {
     fn default() -> Self {
         Self {
             max_live_ratio: 0.5,
-            max_pass_bytes: 512 * 1024 * 1024,
+            max_pass_bytes: u64::MAX,
+            runtime: None,
             relocate_chunk_bytes: 64 * 1024 * 1024,
             dry_run: false,
             allow_consecutive: false,
@@ -313,7 +329,8 @@ impl S3Cleaner {
         }
 
         let report = build_report(&view);
-        let pass_cap = pass_cap(opts.max_pass_bytes, &view.fmt);
+        let runtime = compaction_runtime(opts.runtime.as_ref());
+        let pass_cap = pass_cap(opts.max_pass_bytes, &view.fmt, &runtime);
         let (selected, bytes_planned, bytes_freed, more_remaining) =
             plan_pass(&report.objects, opts.max_live_ratio, pass_cap);
         debug!("compact: {} object(s) selected of {} in range, {} live bytes (cap {})",
@@ -335,14 +352,25 @@ impl S3Cleaner {
             return Ok(outcome);
         }
 
-        let config = compaction_config(&self.root_uri(), bytes_planned, &view);
+        let config = compaction_config(&self.root_uri(), &runtime);
         let mut file = Hyper::open(
             self.client().clone(), config, HyperFileFlags::from_flags(FileFlags::rdwr()),
         ).await?;
         let result = self.relocate_and_publish(&mut file, &view, &selected, opts,
             &mut outcome).await;
-        let _ = file.fs_release().await;
-        result?;
+        match result {
+            // Published, or nothing to publish: close as usual.
+            Ok(()) => { let _ = file.fs_release().await; },
+            // A failed pass publishes nothing. `fs_release` would flush what was
+            // marked, so a pass reported failed could still have published part
+            // of itself. The handle is dropped instead; any partials it wrote sit
+            // above the published checkpoint, where the next open steps past
+            // them and a later `prune` collects them once a publish passes them.
+            Err(e) => {
+                drop(file);
+                return Err(e);
+            },
+        }
         if outcome.checkpoints == 0 {
             return Ok(outcome);
         }
@@ -437,16 +465,34 @@ async fn relocate_runs(file: &mut Hyper<'static>, indices: &[BlockIndex]) -> Res
     Ok(marked)
 }
 
-/// What one pass may rewrite: the caller's budget, and on a container that is not
-/// parted, what one object can hold. Under any other format a checkpoint is one
-/// object, and `hyperfile` refuses a flush larger than that. Room is left for the
-/// summary and the index nodes the same object carries.
-fn pass_cap(max_pass_bytes: u64, fmt: &BlockPtrFormat) -> u64 {
+/// The most a pass holds in memory when nothing can write it out early: a parted
+/// container with partial segments turned off, or a container that is not parted.
+/// There `fs_relocate` keeps every block dirty until the pass's one flush.
+pub const UNBOUNDED_PASS_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What `hyperfile` takes the most bytes of one object to be, for this format and
+/// configuration. A copy of `HyperTrait::max_object_bytes`, which is private, with
+/// its 16 KiB floor.
+fn max_object_bytes(fmt: &BlockPtrFormat, runtime: &HyperFileRuntimeConfig) -> u64 {
+    runtime.segment_max_object_bytes.clamp(16 * 1024, fmt.max_object_bytes()) as u64
+}
+
+/// What one pass may rewrite.
+///
+/// Where `fs_relocate` can write partials, the caller's budget alone: memory is
+/// bounded by the dirty-data limits. Where it cannot, also
+/// [`UNBOUNDED_PASS_BYTES`]. And on a container that is not parted, a checkpoint
+/// is one object and `hyperfile` refuses a flush larger, so the pass also fits
+/// one object, with room for the summary and index nodes it carries.
+fn pass_cap(max_pass_bytes: u64, fmt: &BlockPtrFormat, runtime: &HyperFileRuntimeConfig) -> u64 {
     if fmt.is_parted() {
-        return max_pass_bytes;
+        if runtime.parted_segment_enabled {
+            return max_pass_bytes;
+        }
+        return max_pass_bytes.min(UNBOUNDED_PASS_BYTES);
     }
-    let one_object = fmt.max_object_bytes() as u64;
-    max_pass_bytes.min(one_object / 4 * 3)
+    let one_object = max_object_bytes(fmt, runtime);
+    max_pass_bytes.min(UNBOUNDED_PASS_BYTES).min(one_object / 4 * 3)
 }
 
 /// Candidates, cheapest first, taken whole while they fit `cap`.
@@ -574,33 +620,43 @@ fn into_runs(indices: &[BlockIndex]) -> Vec<(BlockIndex, usize)> {
     runs
 }
 
-/// The configuration a compacting handle needs, and why each field is not the
-/// default.
-fn compaction_config(root_uri: &str, pass_bytes: u64, view: &ContainerView) -> HyperFileConfig {
-    let staging = StagingConfig::new_s3_uri(root_uri, None);
-    // Nothing may publish before the pass is complete. `fs_relocate` does not
-    // check the thresholds itself, but the flush interval is checked on the
-    // flush path, and a pass that crossed a threshold would be cut in two —
-    // which moves `last_cno` twice and leaves `content_cno` marked for only the
-    // second. Both thresholds and the segment buffer go above the pass.
-    let room = (pass_bytes as usize)
-        .saturating_add(view.data_block_size)
-        .saturating_mul(2)
-        .max(16 * 1024 * 1024);
-    let runtime = HyperFileRuntimeConfig {
-        data_cache_dirty_max_bytes_threshold: room,
-        data_cache_dirty_max_blocks_threshold: room / view.data_block_size.max(1),
-        segment_buffer_size: room,
+/// The runtime configuration a compaction uses when the caller gives none.
+///
+/// Partials of 64 MiB: large enough that a compacted range reads in few requests,
+/// small enough to bound what a pass holds. The flush interval is an hour so that
+/// partials are cut by size rather than by how long the reads took.
+pub fn compaction_runtime_default() -> HyperFileRuntimeConfig {
+    const PART: usize = 64 * 1024 * 1024;
+    HyperFileRuntimeConfig {
+        data_cache_dirty_max_bytes_threshold: PART,
+        data_cache_dirty_min_bytes_to_part: PART,
+        segment_buffer_size: PART,
         data_cache_dirty_max_flush_interval: 3_600_000,
-        // A compactor writes bytes it read earlier. Refreshing and re-publishing
-        // on a conflict, which is what the default does, would republish a stale
-        // copy over another writer's newer one.
-        flush_conflict_policy: FlushConflictPolicy::FailFast,
         ..HyperFileRuntimeConfig::default()
-    };
+    }
+}
+
+/// The caller's runtime configuration, or the default, with the one field a
+/// compaction cannot leave to the caller.
+///
+/// Nothing else needs forcing. A pass never publishes before its flush — since
+/// `hyperfile 0.10.4`, `fs_relocate` answers the dirty-data limits with a partial
+/// or not at all, never with a publish — so the limits can be whatever the
+/// caller's writer uses.
+fn compaction_runtime(given: Option<&HyperFileRuntimeConfig>) -> HyperFileRuntimeConfig {
+    let mut runtime = given.cloned().unwrap_or_else(compaction_runtime_default);
+    // A compactor writes bytes it read earlier. Refreshing and re-publishing on a
+    // conflict, which `RetryLastWriterWins` does, would republish a stale copy
+    // over another writer's newer one.
+    runtime.flush_conflict_policy = FlushConflictPolicy::FailFast;
+    runtime
+}
+
+fn compaction_config(root_uri: &str, runtime: &HyperFileRuntimeConfig) -> HyperFileConfig {
+    let staging = StagingConfig::new_s3_uri(root_uri, None);
     HyperFileConfigBuilder::new()
         .with_staging_config(&staging)
-        .with_runtime_config(&runtime)
+        .with_runtime_config(runtime)
         .build()
 }
 
@@ -687,19 +743,52 @@ mod tests {
         assert!(!more);
     }
 
-    /// A parted container splits a large checkpoint into several objects, so only
-    /// the caller's budget applies. Any other format writes a checkpoint as one
-    /// object and refuses a flush past it, so the pass has to fit one, with room
-    /// for what else that object carries.
+    /// Where partials can be written, memory is bounded by the dirty-data limits
+    /// and only the caller's budget applies. Where they cannot, the pass is held
+    /// in memory whole and is capped; and a container that is not parted also has
+    /// to fit its pass in one object, as `hyperfile` reckons one — the caller's
+    /// `segment_max_object_bytes` included.
     #[test]
-    fn an_unparted_pass_fits_one_object() {
+    fn the_pass_cap_follows_what_can_write_it_out() {
         let big = u64::MAX;
-        assert_eq!(pass_cap(big, &BlockPtrFormat::PartedSegment), big);
+        let parts_on = compaction_runtime(None);
+        assert!(parts_on.parted_segment_enabled);
+        assert_eq!(pass_cap(big, &BlockPtrFormat::PartedSegment, &parts_on), big);
+
+        let parts_off = HyperFileRuntimeConfig { parted_segment_enabled: false, ..parts_on.clone() };
+        assert_eq!(pass_cap(big, &BlockPtrFormat::PartedSegment, &parts_off), UNBOUNDED_PASS_BYTES);
+
         let mg = BlockPtrFormat::MicroGroup.max_object_bytes() as u64;
-        assert!(pass_cap(big, &BlockPtrFormat::MicroGroup) < mg);
-        assert!(pass_cap(big, &BlockPtrFormat::MicroGroup) >= mg / 2);
-        assert_eq!(pass_cap(4096, &BlockPtrFormat::MicroGroup), 4096,
+        let cap = pass_cap(big, &BlockPtrFormat::MicroGroup, &parts_on);
+        assert!(cap < mg && cap <= UNBOUNDED_PASS_BYTES);
+
+        let small_objects = HyperFileRuntimeConfig {
+            segment_max_object_bytes: 1024 * 1024, ..parts_on.clone()
+        };
+        assert_eq!(pass_cap(big, &BlockPtrFormat::MicroGroup, &small_objects), 1024 * 1024 / 4 * 3,
+            "the caller's object size is what hyperfile refuses past");
+        assert_eq!(pass_cap(4096, &BlockPtrFormat::MicroGroup, &parts_on), 4096,
             "a smaller budget is kept as given");
+    }
+
+    /// The caller's configuration is used as given, except for the conflict
+    /// policy, which a compactor cannot leave at retry-and-overwrite.
+    #[test]
+    fn a_given_runtime_is_kept_but_for_the_conflict_policy() {
+        use hyperfile::config::FlushConflictPolicy;
+        let given = HyperFileRuntimeConfig {
+            data_cache_dirty_min_bytes_to_part: 16 * 1024 * 1024,
+            data_cache_dirty_max_bytes_threshold: 16 * 1024 * 1024,
+            segment_mpu_chunk_size: 16 * 1024 * 1024,
+            flush_conflict_policy: FlushConflictPolicy::RetryLastWriterWins,
+            ..HyperFileRuntimeConfig::default()
+        };
+        let used = compaction_runtime(Some(&given));
+        assert_eq!(used.flush_conflict_policy, FlushConflictPolicy::FailFast);
+        assert_eq!(HyperFileRuntimeConfig {
+            flush_conflict_policy: FlushConflictPolicy::RetryLastWriterWins, ..used
+        }, given);
+        assert_eq!(compaction_runtime(None).flush_conflict_policy, FlushConflictPolicy::FailFast);
     }
 
     /// An object whose live data alone is over the budget is never taken, and

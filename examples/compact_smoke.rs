@@ -422,6 +422,68 @@ async fn unparted(client: &Client, uri: &str) -> Result<()> {
     Ok(())
 }
 
+/// A pass larger than the dirty-data limits, under a runtime configuration the
+/// caller gives.
+///
+/// `fs_relocate` writes such a pass out as partials as it goes (hyperfile 0.10.4),
+/// so what it holds stays near the limits, and the pass is still one checkpoint,
+/// still marked as moving blocks only. The caller's configuration decides the
+/// size of those partials.
+async fn pass_written_as_partials(client: &Client, uri: &str) -> Result<()> {
+    println!("=== a pass past the limits, written out as partials");
+    const BLOCKS: usize = 256; // 1 MiB of live data across 256 checkpoints
+    let _ = Hyper::fs_unlink(client, uri).await;
+    let mut file = Hyper::fs_create(
+        client, uri, FileFlags::rdwr(), FileMode::default_file()).await?;
+    for idx in 0..BLOCKS {
+        let _ = file.fs_write(idx * BS, &vec![idx as u8; BS]).await?;
+        let _ = file.fs_flush().await?;
+    }
+    let _ = file.fs_release().await?;
+
+    // Partials of 128 KiB, handed blocks 64 KiB at a time.
+    let part = 128 * 1024;
+    let runtime = HyperFileRuntimeConfig {
+        data_cache_dirty_max_bytes_threshold: part,
+        data_cache_dirty_max_blocks_threshold: part / BS,
+        data_cache_dirty_min_bytes_to_part: part,
+        segment_buffer_size: part,
+        ..HyperFileRuntimeConfig::default()
+    };
+    let cleaner = S3Cleaner::with_client(client, uri).await?;
+    let (content_before, last_before) = cnos(client, uri).await?;
+    let out = cleaner.compact(1, 0, &CompactOptions {
+        runtime: Some(runtime),
+        relocate_chunk_bytes: 16 * BS,
+        ..Default::default()
+    }).await?;
+    let (content_after, last_after) = cnos(client, uri).await?;
+    println!("compacted: {} block(s) in {} checkpoint(s); last_cno {} -> {}, content_cno {} -> {}",
+        out.blocks_rewritten, out.checkpoints, last_before, last_after, content_before, content_after);
+    assert_eq!(out.blocks_rewritten, BLOCKS - 1);
+    assert_eq!(out.checkpoints, 1);
+    assert_eq!(last_after, last_before + 1, "partials do not take a number of their own");
+    assert_eq!(content_after, content_before, "partials and all, it is a compaction");
+
+    let report = cleaner.report(1, 0).await?;
+    let new_objects: Vec<_> = report.objects.iter()
+        .filter(|o| o.segid.as_cno() == last_after).collect();
+    let partials = new_objects.iter().filter(|o| o.segid.is_partial()).count();
+    println!("checkpoint {}: {} object(s), {} written as partials, largest {} bytes",
+        last_after, new_objects.len(), partials,
+        new_objects.iter().map(|o| o.bytes).max().unwrap_or(0));
+    assert!(partials >= 4, "~1 MiB in 128 KiB partials should be several, got {}", partials);
+    assert!(new_objects.iter().all(|o| o.bytes <= 4 * part as u64),
+        "a partial stays near the limit it was cut at");
+
+    cleaner.prune(1, 0).await?;
+    for idx in [0usize, 1, 100, 200, 254, 255] {
+        verify_block(client, uri, idx, idx as u8).await?;
+    }
+    let _ = Hyper::fs_unlink(client, uri).await;
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -436,6 +498,7 @@ async fn main() -> Result<()> {
     sparse_in_small_batches(&client, &format!("{}/sparse", uri)).await?;
     consecutive_passes(&client, &format!("{}/consecutive", uri)).await?;
     unparted(&client, &format!("{}/unparted", uri)).await?;
+    pass_written_as_partials(&client, &format!("{}/partials", uri)).await?;
     println!("OK");
     Ok(())
 }
