@@ -90,6 +90,17 @@ pub struct ObjectUsage {
     pub live_meta_blocks: usize,
     /// What those occupy, by the container's own block sizes.
     pub live_bytes: u64,
+    /// Whether the live metadata in it is rewritten by rewriting its live data.
+    ///
+    /// True for a data part — any part above 0 — of a `StreamSegment` container.
+    /// That layout puts every leaf of the block map in the object holding the data
+    /// under it, and the nodes above the leaves in part 0 only. A leaf in a data
+    /// part is therefore live only while none of the blocks it was written with
+    /// has changed, so those blocks are live and in the same object; relocating
+    /// them dirties the leaf, and the flush writes it elsewhere with them.
+    /// Under every other format the nodes sit in part 0 or the one object, apart
+    /// from the data they describe, and this is false.
+    pub meta_moves_with_data: bool,
 }
 
 impl ObjectUsage {
@@ -109,11 +120,12 @@ impl ObjectUsage {
 
     /// Whether a live metadata node is in it.
     ///
-    /// Such an object cannot be freed by rewriting data blocks: a node is
-    /// relocated when the flush rewrites it, which happens because something
+    /// Such an object cannot in general be freed by rewriting data blocks: a node
+    /// is relocated when the flush rewrites it, which happens because something
     /// under it was dirtied, and which node covers which keys is not visible from
     /// outside the map. Compaction skips these rather than rewriting their data
-    /// blocks for nothing.
+    /// blocks for nothing — unless [`Self::meta_moves_with_data`] says the node
+    /// goes with the data.
     pub fn holds_metadata(&self) -> bool {
         self.live_meta_blocks > 0
     }
@@ -556,6 +568,7 @@ pub(crate) fn build_report(view: &ContainerView) -> Report {
             live_meta_blocks,
             live_bytes: (live_data_blocks * view.data_block_size
                 + live_meta_blocks * view.meta_block_size) as u64,
+            meta_moves_with_data: view.fmt.is_stream() && segid.is_partial(),
         });
     }
 
@@ -575,11 +588,17 @@ pub(crate) fn build_report(view: &ContainerView) -> Report {
 ///
 /// Three exclusions, each for its own reason: a dead object is `prune`'s work and
 /// rewriting nothing frees nothing; an object holding a live metadata node cannot
-/// be freed by rewriting data blocks, so its data would be rewritten for no
-/// return; and one above the ratio costs more to rewrite than the policy accepts.
+/// in general be freed by rewriting data blocks, so its data would be rewritten
+/// for no return — except where the layout puts that node with the data
+/// ([`ObjectUsage::meta_moves_with_data`]); and one above the ratio costs more to
+/// rewrite than the policy accepts.
+///
+/// Getting the middle one wrong costs a rewrite, never data: compaction deletes
+/// nothing, `prune` keeps whatever the walk afterwards finds live, and
+/// [`CompactOutcome::still_referenced`] reports an object selected and not freed.
 fn is_candidate(usage: &ObjectUsage, max_live_ratio: f64) -> bool {
     !usage.is_dead()
-        && !usage.holds_metadata()
+        && (!usage.holds_metadata() || usage.meta_moves_with_data)
         && usage.live_ratio() <= max_live_ratio
 }
 
@@ -671,6 +690,7 @@ mod tests {
             live_data_blocks: data,
             live_meta_blocks: meta,
             live_bytes: (data * 4096 + meta * 4096) as u64,
+            meta_moves_with_data: false,
         }
     }
 
@@ -689,6 +709,18 @@ mod tests {
         let o = usage(SegmentId::with_part(3, 0), 1 << 20, 1, 1);
         assert!(o.holds_metadata());
         assert!(!is_candidate(&o, 1.0));
+    }
+
+    /// A stream data part keeps its leaves with its data, so it is a candidate
+    /// despite them; its part 0, which holds the nodes above the leaves, is not.
+    #[test]
+    fn a_stream_data_part_is_a_candidate_despite_its_leaves() {
+        let part = ObjectUsage { meta_moves_with_data: true,
+            ..usage(SegmentId::with_part(3, 2), 1 << 20, 20, 1) };
+        assert!(part.holds_metadata());
+        assert!(is_candidate(&part, 0.5));
+        let part0 = usage(SegmentId::with_part(3, 0), 1 << 20, 20, 1);
+        assert!(!is_candidate(&part0, 1.0));
     }
 
     #[test]

@@ -23,8 +23,9 @@ ends; `high == 0` is a sentinel for "use the latest checkpoint".
 
 What is reported and deleted is a `SegmentId`, which names a stored
 object. Under `BlockPtrFormat::PartedSegment` — the default since
-`hyperfile 0.7.0` — one checkpoint may be several objects, `7.0`,
-`7.1`, … — and they are reclaimed separately, because a checkpoint
+`hyperfile 0.7.0` — and `StreamSegment` (`hyperfile 0.11.0`), one
+checkpoint may be several objects, `7.0`, `7.1`, … — and they are
+reclaimed separately, because a checkpoint
 abandoned partway leaves its partials behind under the same number
 the retry then reuses. Under every other format an object is a
 checkpoint and prints as the plain number.
@@ -158,10 +159,17 @@ across an await. Await it where it is created rather than spawning it.
   `flush_conflict_policy` is overridden, to `FailFast`.
 - An inline file or a device node has no segments; `collect`, `prune`,
   `report` and `compact` refuse them.
-- An object holding a live metadata node is not a compaction candidate.
-  A node is relocated when the flush rewrites it, which needs something
-  under it dirtied, and which keys a node covers is not visible from
-  here.
+- An object holding a live metadata node is not a compaction candidate,
+  except a data part of a `StreamSegment` container. A node is relocated
+  when the flush rewrites it, which needs something under it dirtied,
+  and which keys a node covers is not visible from here; the stream
+  layout is the exception because it keeps every leaf in the object
+  with its data, so rewriting the data rewrites the leaf.
+- A container whose inode records a format this build does not know is
+  refused. Cleaners up to 0.10.5 instead read it as `MicroGroup`, and
+  on a `StreamSegment` container that reports every object unreferenced:
+  **do not run a cleaner older than 0.11 on a container written by
+  hyperfile 0.11 in the stream format.**
 
 ## Status
 

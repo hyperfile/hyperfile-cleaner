@@ -339,7 +339,7 @@ impl S3Cleaner {
         // which object holds a checkpoint's summary and how a pointer decodes.
         let (raw_inode, inode_state) = self.load_raw_inode().await?;
         refuse_unsegmented(&raw_inode)?;
-        let fmt = container_ptr_format(&raw_inode);
+        let fmt = container_ptr_format(&raw_inode)?;
         let latest_compacted = raw_inode.is_compacted();
         let high_cno = if high == 0 {
             let inode = Inode::from_raw(&raw_inode, inode_state);
@@ -359,6 +359,19 @@ impl S3Cleaner {
         // since `hyperfile 0.7.0` is every container it creates.
         let high_summary = summary_obj(high_cno, &fmt);
         let ss = self.load_segment_sum(high_summary).await?;
+        // The summary has to be the checkpoint asked for. Every segment this
+        // crate's hyperfile writes carries its checkpoint number, in either
+        // layout; a header that does not is not one, and walking a bmap read out
+        // of it would report whatever the bytes happen to point at.
+        if !ss.hdr.has_magic() || ss.hdr.s_cno != high_cno {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "{} does not read as checkpoint {}'s summary (magic {:#x}, checkpoint {})",
+                    high_summary, high_cno, ss.hdr.s_magic, ss.hdr.s_cno,
+                ),
+            ));
+        }
         // The whole inode is moved into the walk, not just its `i_bmap` field:
         // `BMap::read` wants an 8-byte-aligned buffer, and `BMapRawType` is
         // `[u8; N]`, whose own alignment is 1, so a copy of the field alone
@@ -398,6 +411,19 @@ impl S3Cleaner {
         };
 
         let listing = self.list_segment_objects().await?;
+        // The object the walk read has to be one the listing names, under that
+        // name. Otherwise this cleaner and the store disagree about what the
+        // objects are called — and `prune` keeps `high_summary` by its name.
+        if !listing.objects.iter().any(|(segid, _)| *segid == high_summary) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "the listing has no object named {}, the summary just read; \
+                     refusing to judge what is referenced",
+                    high_summary,
+                ),
+            ));
+        }
         Ok(ContainerView {
             low,
             high_cno,
@@ -540,22 +566,32 @@ fn refuse_unsegmented(raw: &InodeRaw) -> Result<()> {
 
 /// The pointer format the container was written with, as its inode records it.
 ///
-/// Falls back to the pre-parting format rather than failing. A container written
-/// before `i_meta_config` was populated carries zero there, which decodes to
-/// nothing usable — and a container that old cannot be parted, because parting
-/// did not exist. The only thing this decides is how a pointer's low bits are
-/// read and which name holds a summary, and for every format but
-/// `PartedSegment` those are what they have always been.
-fn container_ptr_format(raw_inode: &InodeRaw) -> BlockPtrFormat {
-    match HyperFileMetaConfig::try_from_u32(raw_inode.i_meta_config) {
-        Ok(cfg) => cfg.block_ptr_format,
-        Err(e) => {
-            debug!("inode meta config {:#x} is not one this build can read ({}); \
-                reading pointers as {:?}", raw_inode.i_meta_config, e,
-                BlockPtrFormat::MicroGroup);
-            BlockPtrFormat::MicroGroup
-        },
+/// A container written before `i_meta_config` was populated carries zero there;
+/// it predates every format with parts, so its pointers read as `MicroGroup`.
+/// That is the only case read on a guess.
+///
+/// Anything else that does not decode is refused. Up to 0.10.5 every such value
+/// fell back to `MicroGroup`, and on a `StreamSegment` container — format byte 4,
+/// new in `hyperfile 0.11.0` — that made a 0.10.5 cleaner decode no pointer into
+/// any of its `<cno>.<part>` objects and report every one of them unreferenced,
+/// the newest checkpoint included. Measured: a container of two checkpoints in
+/// twelve objects came back `referenced=0`, all twelve offered to `prune`. A
+/// format this build does not know is a reason to stop, not to guess.
+fn container_ptr_format(raw_inode: &InodeRaw) -> Result<BlockPtrFormat> {
+    if raw_inode.i_meta_config == 0 {
+        return Ok(BlockPtrFormat::MicroGroup);
     }
+    HyperFileMetaConfig::try_from_u32(raw_inode.i_meta_config)
+        .map(|cfg| cfg.block_ptr_format)
+        .map_err(|e| Error::new(
+            ErrorKind::Unsupported,
+            format!(
+                "the container's inode records a format this build cannot read \
+                 (meta config {:#x}: {}); a cleaner built against an older hyperfile \
+                 must not walk it, since it would misread every pointer",
+                raw_inode.i_meta_config, e,
+            ),
+        ))
 }
 
 /// The object holding a checkpoint's summary, metadata blocks and inode.
@@ -766,6 +802,28 @@ mod tests {
         assert_eq!(trim_root_uri("s3://"), "s3://");
         assert_eq!(trim_root_uri("S3://"), "S3://");
         assert_eq!(trim_root_uri(""), "");
+    }
+
+    /// Only a zero meta config is read on a guess; a value that does not decode is
+    /// refused rather than read as `MicroGroup`, which is how a 0.10.5 cleaner
+    /// misread every pointer of a `StreamSegment` container.
+    #[test]
+    fn an_unknown_format_is_refused_not_guessed() {
+        let legacy = InodeRaw { i_meta_config: 0, ..Default::default() };
+        assert_eq!(container_ptr_format(&legacy).unwrap(), BlockPtrFormat::MicroGroup);
+
+        for fmt in [BlockPtrFormat::MicroGroup, BlockPtrFormat::PartedSegment,
+                    BlockPtrFormat::StreamSegment] {
+            let cfg = HyperFileMetaConfig::new(56, 4096, 4096, fmt);
+            let raw = InodeRaw { i_meta_config: cfg.as_u32(), ..Default::default() };
+            assert_eq!(container_ptr_format(&raw).unwrap(), fmt);
+        }
+
+        let future = HyperFileMetaConfig::new(56, 4096, 4096, BlockPtrFormat::PartedSegment)
+            .as_u32() & !0xFF | 0x7F;
+        let raw = InodeRaw { i_meta_config: future, ..Default::default() };
+        let e = container_ptr_format(&raw).expect_err("an unknown format byte must be refused");
+        assert_eq!(e.kind(), ErrorKind::Unsupported);
     }
 
     /// An inline file's checkpoint fields hold its data, and a device node's hold

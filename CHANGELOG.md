@@ -9,6 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.11.0] - 2026-10-17
+
+Follows `hyperfile 0.11.0` and its new `BlockPtrFormat::StreamSegment`: `collect`,
+`prune`, `report` and `compact` work on a container in that format.
+
+### Changed
+
+- **`hyperfile` requirement moves to `0.11.0`.** The minor follows `hyperfile`'s, as
+  before.
+- **A data part of a `StreamSegment` container is a compaction candidate even while
+  it holds a live leaf of the block map.** That layout writes every leaf into the
+  object holding the data under it, and the nodes above the leaves into part 0 only.
+  A leaf in a data part is live only while none of the blocks it was written with
+  has changed, so those blocks are live and in the same object; relocating them
+  dirties the leaf, and the flush writes it elsewhere with them. Under every other
+  format, and for part 0, an object holding a live metadata node is still not a
+  candidate. `ObjectUsage::meta_moves_with_data` says which case an object is.
+  Choosing wrong would cost a rewrite and not data: compaction deletes nothing, and
+  an object selected and not freed is reported in `still_referenced`.
+
+  Nothing else needed changing. `StreamSegment` addresses objects as
+  `PartedSegment` does — `<cno>.<part>`, part 0 the checkpoint — and decodes its
+  pointers the same way, and `hyperfile` reads either layout's summary itself.
+
+### Fixed
+
+- **A format this build cannot read is refused instead of read as `MicroGroup`.**
+  Every inode meta config that did not decode used to fall back to `MicroGroup`.
+  Only zero — a container older than the field — is still read that way; anything
+  else is `Unsupported`. On a `StreamSegment` container, format byte 4, a 0.10.5
+  cleaner falls back, decodes no pointer into any `<cno>.<part>` object, and reports
+  every object unreferenced, the newest checkpoint included: measured on a container
+  of two checkpoints in twelve objects, `referenced=0` and all twelve offered to
+  `prune`.
+- **The walk checks what it read before judging anything.** The summary it walks
+  must carry a segment magic and the checkpoint number asked for, and the listing
+  must name that summary's object under that name; otherwise `InvalidData`. With the
+  format check disabled to recreate the 0.10.5 misreading, the listing check alone
+  refused the walk on real S3.
+
+### Verified
+
+- `examples/stream_smoke` (new), against real S3 in both builds:
+  - A `StreamSegment` container of two checkpoints, about 1 MiB objects, checkpoint
+    1 left 1.5% live: `collect` and `prune` exact with the data intact; `compact`
+    rewrites every live block of the twelve candidates in one checkpoint with
+    `content_cno` unchanged, and `prune` then leaves nothing of checkpoint 1.
+  - Objects holding a live leaf: half of every 1024 blocks overwritten, leaving
+    leaves live in half-dead data parts. Selected — three such in the `blocking`
+    build, one in `reactor`, where sending ahead cuts objects differently — with
+    `still_referenced` empty, every selected object gone after `prune`, storage
+    25.4 MB down to 17.0 MB, and every block reading back.
+- `compact_smoke`, `far_smoke`, `split_smoke`, `parted_smoke` and `smoke` unchanged,
+  in both builds.
+- 28 unit tests, two new: a stream data part is a candidate and its part 0 is not,
+  and an unknown format is refused while zero is still read as `MicroGroup`; the
+  doctest; `clippy --all-targets` clean with `-D warnings` in both builds, by exit
+  status; `cargo publish --dry-run`.
+
 ## [0.10.5] - 2026-10-05
 
 A compaction pass on a parted container is no longer bounded by memory, and the
