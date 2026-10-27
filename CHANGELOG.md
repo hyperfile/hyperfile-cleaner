@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > may contain breaking API or on-disk changes. Read the **Breaking changes**
 > section before upgrading.
 
+## [0.12.0] - 2026-10-27
+
+Follows `hyperfile 0.12.0`: compaction beside the writer, and prune with a grace.
+
+### Added
+
+- **`CompactOptions::beside_writer`**: the pass attaches its copies to the stored
+  inode (`Hyper::fs_publish_compaction`) rather than publishing a checkpoint, and
+  the writer takes them in before its next publish of data. `last_cno` and
+  `content_cno` stay. `CompactOptions::max_age` (ten minutes by default) bounds
+  the pass; set it below any prune grace. `CompactOutcome::attached` reports
+  what was attached; `still_referenced` is judged by the attached map. The handle
+  is opened with `take_up_on_open` off, so a writer's commit in flight is left to
+  it (`ResourceBusy`, try again).
+- **`S3Cleaner::prune_with` and `PruneOptions`** (`grace`, `dry_run`): keeps every
+  object a version current in the last `grace` points into, and every object
+  written in it.
+- **`Report::attached`**: a compaction attached and not yet taken in.
+
+### Changed
+
+- **Every prune keeps what an attached compaction points into**, read from the
+  inode object's metadata, and refuses, deleting nothing, when the inode says a
+  compaction is attached and the metadata does not read.
+- **The newest checkpoint is walked as the stored inode has it**, not as its
+  summary does.
+- **`hyperfile` requirement moves to `0.12.0`.** The minor follows `hyperfile`'s, as
+  before.
+
+### Breaking changes
+
+- `CompactOptions` has a new field, `max_age`; `CompactOutcome` and `Report` have
+  a new field, `attached`. Struct literals that do not use `..Default::default()`
+  need them.
+- A prune of a container whose inode says a compaction is attached, and whose
+  metadata does not read, fails with `InvalidData` instead of deleting.
+
 ## [0.11.0] - 2026-10-17
 
 Follows `hyperfile 0.11.0` and its new `BlockPtrFormat::StreamSegment`: `collect`,
