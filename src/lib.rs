@@ -25,6 +25,11 @@
 //!
 //! ## Concurrency caveat
 //!
+//! `prune` takes every object the newest version, and a compaction attached to
+//! it, do not point into. Readers holding an older version, and a compaction
+//! beside the writer that has not yet attached its copies, need objects neither
+//! names: use [`s3::S3Cleaner::prune_with`] with a grace for those.
+//!
 //! The cleaner does not coordinate with in-flight writers. It
 //! takes a snapshot of the inode at the start of the call and
 //! operates on that. New segments published after that point are

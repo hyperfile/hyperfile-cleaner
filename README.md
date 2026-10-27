@@ -80,14 +80,43 @@ checkpoint that is already marked unless `allow_consecutive` is set.
 pass as a change — they will when an earlier flush failed and gave its
 number up, which the mark does not span.
 
-**Compaction requires exclusive write access.** It is a writer, and it
-writes bytes it read earlier, so it runs with
+**By default compaction requires exclusive write access.** It is a
+writer, and it writes bytes it read earlier, so it runs with
 `FlushConflictPolicy::FailFast` and a concurrent publish makes the pass
 fail rather than overwrite the other writer's newer data. It also
 refuses to run when the container's prefix holds keys that are neither
 the inode nor segment objects, because a WAL is the usual reason and a
 compactor that does not read the log would publish over entries
 recovery has not replayed.
+
+**`CompactOptions::beside_writer` compacts while the writer runs.** The
+pass writes its copies and their map under the published number, and
+*attaches* them to the stored inode: one conditional write that sets a
+bit and puts the compaction in the inode object's metadata, nothing else
+changed. `last_cno` and `content_cno` both stay. A writer of `hyperfile`
+0.12 or later takes the compaction in before its next publish of data,
+keeping every block it changed since, rather than failing as on a second
+writer; until then readers read the objects as they were. Needs
+`PartedSegment` or `StreamSegment`. `CompactOutcome::attached` says what
+was attached and to which number. The pass fails with `ResourceBusy`
+while another compaction is attached, or while the writer has a
+checkpoint on storage it has not yet pointed the inode at, and with
+`TimedOut` past `CompactOptions::max_age`; either is worth trying again
+later. `Report::attached` shows a compaction not yet taken in. See
+`docs/compaction.md` in `hyperfile`.
+
+**`prune_with` keeps what readers may still read.** `prune` takes every
+object the newest version does not point into, except what an attached
+compaction points into: those are kept by every prune, and a prune
+refuses, deleting nothing, when the inode says a compaction is attached
+and its metadata does not read. A reader that opened an older version, a
+read planned under one and fetched outside the handle, and a compaction
+that has written its copies and not yet attached them all need objects
+the newest version does not name. `PruneOptions::grace` keeps everything
+a version current at any time in the last `grace` points into, and every
+object written in it. Make it longer than any reader holds a version,
+and set `CompactOptions::max_age` below it. The objects a compaction
+empties become reclaimable once the writer has taken it in.
 
 ## Usage
 
@@ -104,6 +133,11 @@ println!("unreferenced segments: {:?}", unrefed);
 
 // Actually delete.
 cleaner.prune(1, 0).await?;
+
+// Beside readers and a compactor: keep what was current in the last hour.
+use hyperfile_cleaner::s3::PruneOptions;
+let opts = PruneOptions { grace: std::time::Duration::from_secs(3600), ..Default::default() };
+let deleted = cleaner.prune_with(1, 0, &opts).await?;
 # Ok(())
 # }
 ```
