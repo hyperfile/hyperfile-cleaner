@@ -47,6 +47,19 @@
 //! to start on a checkpoint that is already marked unless
 //! [`CompactOptions::allow_consecutive`] says otherwise.
 //!
+//! ## Beside the writer
+//!
+//! With [`CompactOptions::beside_writer`] the pass is not a second writer:
+//! `Hyper::fs_begin_compaction` takes up the stored version, `fs_relocate`
+//! copies the blocks as below, and `fs_publish_compaction` writes the copies'
+//! map and *attaches* it to the stored inode -- its object's metadata, with one
+//! conditional write that changes nothing else. The writer takes the
+//! compaction in before its next publish of data and keeps every block it
+//! changed, so `FailFast` on the writer's side still stops only a second writer.
+//! Until then readers read through the objects as they were, and the emptied
+//! objects become reclaimable only once the writer has published. What follows
+//! is about the default.
+//!
 //! ## Why offline
 //!
 //! A compactor is a writer, and it writes *old* bytes — the content it read
@@ -70,6 +83,7 @@ use log::{debug, info, warn};
 use hyperfile::{BlockIndex, Cno, SegmentId};
 use hyperfile::config::{FlushConflictPolicy, HyperFileConfig, HyperFileConfigBuilder,
     HyperFileRuntimeConfig};
+use hyperfile::file::file::CompactionAttached;
 use hyperfile::file::flags::{FileFlags, HyperFileFlags};
 use hyperfile::file::hyper::Hyper;
 use hyperfile::meta_format::BlockPtrFormat;
@@ -140,6 +154,10 @@ pub struct Report {
     /// (`InodeRaw::FLAG_COMPACTED`). `compact` will not run on top of one unless
     /// asked to, since a second pass in a row moves `content_cno`.
     pub latest_compacted: bool,
+    /// A compaction attached to the stored inode beside the writer and not yet
+    /// taken in, as its object's metadata has it: the version it was built on,
+    /// its parts, blocks moved and its map. `Unreadable` stops `prune`.
+    pub attached: hyperfile::compaction::StoredCompaction,
     pub data_block_size: usize,
     pub meta_block_size: usize,
     /// Objects whose checkpoint falls in the queried `[low, high]`, ascending.
@@ -232,6 +250,25 @@ pub struct CompactOptions {
     /// Run even though the prefix holds keys this crate does not recognize. Only
     /// set this having established that they are not a WAL.
     pub allow_foreign_keys: bool,
+    /// Compact beside the container's writer: attach the pass to the stored inode
+    /// rather than publish a checkpoint of its own (`Hyper::fs_begin_compaction`
+    /// and `fs_publish_compaction` in `hyperfile`). It keeps the checkpoint
+    /// number and the content checkpoint, and a writer of hyperfile 0.12 or later
+    /// takes it in before its next publish of data rather than failing as on a
+    /// second writer. Needs a container with parts (`PartedSegment`,
+    /// `StreamSegment`). `allow_consecutive` does not apply: an attached
+    /// compaction never moves `content_cno`.
+    ///
+    /// The pass fails with `ResourceBusy` while a compaction is attached and not
+    /// yet taken in, or while the writer's publish is on its way, and with
+    /// `TimedOut` past `max_age`; either way try again later.
+    pub beside_writer: bool,
+    /// Beside the writer, the longest a pass may take from its start to its
+    /// attach; past it the pass is given up. Its copies are referenced by
+    /// nothing until attached, and only a `prune` grace keeps them, so set this
+    /// below the grace of any [`S3Cleaner::prune_with`] that may run meanwhile,
+    /// less a margin. Ten minutes by default.
+    pub max_age: std::time::Duration,
 }
 
 impl Default for CompactOptions {
@@ -244,6 +281,8 @@ impl Default for CompactOptions {
             dry_run: false,
             allow_consecutive: false,
             allow_foreign_keys: false,
+            beside_writer: false,
+            max_age: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -264,8 +303,13 @@ pub struct CompactOutcome {
     /// The selected objects' stored bytes — what `prune` can now reclaim.
     pub bytes_freed: u64,
     /// Checkpoints published: one for a pass that rewrote anything, none
-    /// otherwise. That is how far `last_cno` advanced.
+    /// otherwise. That is how far `last_cno` advanced. Always none beside the
+    /// writer, whose pass keeps the number: see `attached`.
     pub checkpoints: usize,
+    /// Beside the writer, what was attached: the version it was built on and the
+    /// one it was attached to, the parts its objects are in, blocks moved, and
+    /// how many conditional writes of the inode it took.
+    pub attached: Option<CompactionAttached>,
     /// `fs_content_cno` before and after the pass. Equal when consumers will not
     /// see the pass as a change of content, which is the ordinary case. They
     /// differ when the publish could not be marked: its number did not follow the
@@ -327,7 +371,7 @@ impl S3Cleaner {
             ));
         }
 
-        if view.latest_compacted && !opts.allow_consecutive && !opts.dry_run {
+        if view.latest_compacted && !opts.allow_consecutive && !opts.dry_run && !opts.beside_writer {
             return Err(Error::new(
                 ErrorKind::InvalidInput,
                 format!(
@@ -341,7 +385,13 @@ impl S3Cleaner {
         }
 
         let report = build_report(&view);
-        let runtime = compaction_runtime(opts.runtime.as_ref());
+        let mut runtime = compaction_runtime(opts.runtime.as_ref());
+        if opts.beside_writer {
+            // Not the writer: a checkpoint the writer has on storage and has not
+            // yet pointed the inode at is the writer's to publish. Taking it up
+            // here would publish it under the writer and fail its own inode write.
+            runtime.take_up_on_open = false;
+        }
         let pass_cap = pass_cap(opts.max_pass_bytes, &view.fmt, &runtime);
         let (selected, bytes_planned, bytes_freed, more_remaining) =
             plan_pass(&report.objects, opts.max_live_ratio, pass_cap);
@@ -383,15 +433,20 @@ impl S3Cleaner {
                 return Err(e);
             },
         }
-        if outcome.checkpoints == 0 {
+        if outcome.checkpoints == 0 && outcome.attached.is_none_or(|p| p.moved == 0) {
             return Ok(outcome);
         }
 
         // Say what was actually freed rather than what should have been. A
         // selected object that is still referenced means a block was not
-        // relocated, which is worth reporting where it can be seen.
+        // relocated, which is worth reporting where it can be seen. Beside the
+        // writer, by the attached map while it is attached: the stored one still
+        // points at every selected object until the writer takes it in.
         let after = self.view(low, 0).await?;
-        let referenced = after.referenced_objects();
+        let referenced = match (after.attached_root()?, outcome.attached) {
+            (Some(root), Some(_)) => self.reachable_objects(&after, root).await?,
+            _ => after.referenced_objects(),
+        };
         outcome.still_referenced = outcome.selected.iter()
             .filter(|segid| referenced.contains(segid))
             .copied()
@@ -426,6 +481,45 @@ impl S3Cleaner {
         if selected.is_empty() {
             return Ok(());
         }
+        if opts.beside_writer {
+            // Takes up the version stored now: the placements below are its.
+            file.fs_begin_compaction().await?;
+            let res = self.relocate_selected(file, view, selected, opts, outcome).await;
+            if res.is_err() || outcome.blocks_rewritten == 0 {
+                let _ = file.fs_abort_compaction().await;
+                return res;
+            }
+            let attached = file.fs_publish_compaction(opts.max_age).await?;
+            outcome.content_cno_after = file.fs_content_cno()?;
+            debug!("compact: attached a compaction of checkpoint {} to checkpoint {}: {} block(s) moved \
+                into parts {}..{}, in {} attempt(s)", attached.base, attached.attached_to, attached.moved,
+                attached.parts.0, attached.parts.1, attached.attempts);
+            outcome.attached = Some(attached);
+            return Ok(());
+        }
+        self.relocate_selected(file, view, selected, opts, outcome).await?;
+        if outcome.blocks_rewritten == 0 {
+            return Ok(());
+        }
+
+        let cno = file.fs_flush().await?;
+        outcome.checkpoints = 1;
+        outcome.content_cno_after = file.fs_content_cno()?;
+        debug!("compact: published checkpoint {} with {} relocated block(s); content_cno \
+            {} -> {}", cno, outcome.blocks_rewritten, outcome.content_cno_before,
+            outcome.content_cno_after);
+        Ok(())
+    }
+
+    /// Mark every block of the selected objects for relocation.
+    async fn relocate_selected(
+        &self,
+        file: &mut Hyper<'static>,
+        view: &ContainerView,
+        selected: &BTreeSet<SegmentId>,
+        opts: &CompactOptions,
+        outcome: &mut CompactOutcome,
+    ) -> Result<()> {
         let bs = view.data_block_size;
         let chunk_blocks = (opts.relocate_chunk_bytes / bs.max(1)).max(1);
 
@@ -454,16 +548,6 @@ impl S3Cleaner {
             outcome.blocks_rewritten += relocate_runs(file, &pending).await?;
         }
         outcome.bytes_rewritten = (outcome.blocks_rewritten * bs) as u64;
-        if outcome.blocks_rewritten == 0 {
-            return Ok(());
-        }
-
-        let cno = file.fs_flush().await?;
-        outcome.checkpoints = 1;
-        outcome.content_cno_after = file.fs_content_cno()?;
-        debug!("compact: published checkpoint {} with {} relocated block(s); content_cno \
-            {} -> {}", cno, outcome.blocks_rewritten, outcome.content_cno_before,
-            outcome.content_cno_after);
         Ok(())
     }
 }
@@ -575,6 +659,7 @@ pub(crate) fn build_report(view: &ContainerView) -> Report {
     Report {
         high_cno: view.high_cno,
         latest_compacted: view.latest_compacted,
+        attached: view.compaction.clone(),
         data_block_size: view.data_block_size,
         meta_block_size: view.meta_block_size,
         objects,
@@ -841,6 +926,7 @@ mod tests {
         let report = Report {
             high_cno: 9,
             latest_compacted: false,
+            attached: Default::default(),
             data_block_size: 4096,
             meta_block_size: 4096,
             objects: vec![

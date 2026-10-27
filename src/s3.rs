@@ -18,6 +18,7 @@ use hyperfile::{BlockIndex, BlockPtr, Cno, SegmentId, s3_code_kind, s3_error_kin
 use hyperfile::file::ReadTiming;
 use hyperfile::meta_loader::s3::S3BlockLoader;
 use hyperfile::ondisk::InodeRaw;
+use hyperfile::compaction::{PendingCompaction, StoredCompaction};
 use hyperfile::inode::{Inode, OnDiskState};
 use hyperfile::segment::{Segment, SegmentSum, SegmentReadWrite};
 use hyperfile::staging::{Staging, config::StagingConfig, s3::S3Staging};
@@ -213,6 +214,9 @@ impl S3Cleaner {
                 match parse_segment_object_name(name) {
                     Some(segid) => {
                         listing.objects.push((segid, obj.size().unwrap_or(0).max(0) as u64));
+                        if let Some(t) = obj.last_modified() {
+                            listing.modified.insert(segid, t.secs());
+                        }
                     },
                     None => {
                         listing.foreign += 1;
@@ -341,12 +345,9 @@ impl S3Cleaner {
         refuse_unsegmented(&raw_inode)?;
         let fmt = container_ptr_format(&raw_inode)?;
         let latest_compacted = raw_inode.is_compacted();
-        let high_cno = if high == 0 {
-            let inode = Inode::from_raw(&raw_inode, inode_state);
-            inode.get_last_cno()
-        } else {
-            high
-        };
+        let compaction = inode_state.as_ref().map(|s| s.compaction.clone()).unwrap_or_default();
+        let latest_cno = Inode::from_raw(&raw_inode, inode_state).get_last_cno();
+        let high_cno = if high == 0 { latest_cno } else { high };
 
         debug!("view of container low: {}, high: {}, format: {:?}", low, high_cno, fmt);
         validate_segid_range(low, high_cno)?;
@@ -378,7 +379,11 @@ impl S3Cleaner {
         // lands wherever the compiler put it. `InodeRaw` is `align(8)` and
         // `i_bmap` sits at an 8-aligned offset within it, so borrowing the
         // field out of an owned inode is aligned by construction.
-        let ss_inode = ss.hdr.s_inode;
+        // The newest checkpoint is walked as the stored inode has it, the map
+        // every reader opens, rather than as its summary does. An older
+        // checkpoint asked for is walked as its summary has it.
+        let walked_stored = high_cno == latest_cno;
+        let ss_inode = if walked_stored { raw_inode } else { ss.hdr.s_inode };
         // Both sizes come from the segment header rather than from the inode's
         // `i_meta_config`: they have been there since the first release, while
         // that field was zero on containers old enough that it cannot be
@@ -427,6 +432,10 @@ impl S3Cleaner {
         Ok(ContainerView {
             low,
             high_cno,
+            stored: raw_inode,
+            walked_stored,
+            walked: ss_inode,
+            compaction,
             latest_compacted,
             fmt,
             high_summary,
@@ -451,15 +460,241 @@ impl S3Cleaner {
         low: Cno,
         high: Cno,
     ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
+        self.collect_within(low, high, std::time::Duration::ZERO).await
+    }
+
+    /// [`Self::collect_unref_seg`], keeping what a reader may still read within
+    /// `grace`: everything a version current at any time in the last `grace`
+    /// points into, and every object written in it. See [`PruneOptions`].
+    async fn collect_within(
+        &self,
+        low: Cno,
+        high: Cno,
+        grace: std::time::Duration,
+    ) -> Result<(Vec<SegmentId>, Vec<SegmentId>)> {
         let view = self.view(low, high).await?;
-        Ok(partition_objects(
+        // What the newest version reads through is never reclaimable, whatever
+        // `high` says.
+        let mut roots = Vec::new();
+        if !view.walked_stored {
+            roots.push(view.stored);
+        }
+        // Nor what a compaction attached to it reads through: the writer's next
+        // publish of data takes its copies in, whatever the grace.
+        if let Some(root) = view.attached_root()? {
+            roots.push(root);
+        }
+        let mut young = BTreeSet::new();
+        if !grace.is_zero() {
+            // The store's clock, not this host's: what is compared with it is the
+            // store's own times.
+            let (now, _) = self.staging.load_segment_timestamp(SegmentId::new_from_cno(view.high_cno)).await?;
+            let cutoff = now.saturating_sub(grace.as_secs().min(i64::MAX as u64) as i64);
+            young = view.listing.modified.iter().filter(|(_, t)| **t >= cutoff).map(|(s, _)| *s).collect();
+            roots.extend(self.versions_since(&view, cutoff).await?);
+        }
+        let more = self.walk_more(&view, roots).await?;
+        let mut referenced = view.referenced_objects();
+        referenced.extend(more.iter().map(|p| view.object_of(p)));
+        let (v_ref, mut unref) = partition_objects(
             &view.object_ids(),
-            &view.referenced_objects(),
+            &referenced,
             view.low,
             view.high_cno,
             view.high_summary,
-        ))
+        );
+        unref.retain(|o| !young.contains(o));
+        Ok((v_ref, unref))
     }
+
+    /// The inodes of every version current at some time since `cutoff`: each
+    /// published since, and the one current at `cutoff`.
+    ///
+    /// A checkpoint is its summary object, and its inode is in that object's
+    /// header; a version's time is when that object was written. A compaction
+    /// attached to the stored inode is not a version: no reader opens it until
+    /// the writer has taken it in and published.
+    async fn versions_since(&self, view: &ContainerView, cutoff: i64) -> Result<Vec<InodeRaw>> {
+        let stream = view.fmt.is_stream();
+        let modified = |id: &SegmentId| view.listing.modified.get(id).copied();
+        let summaries: Vec<(SegmentId, i64)> = view.listing.objects.iter()
+            .map(|(id, _)| *id)
+            .filter(|id| *id == summary_obj(id.as_cno(), &view.fmt))
+            .filter_map(|id| modified(&id).map(|t| (id, t)))
+            .collect();
+        // From the newest checkpoint written before the window: the version
+        // current when it opened is that one or a compaction of it.
+        let from = summaries.iter().rposition(|(_, t)| *t < cutoff).unwrap_or(0);
+        let mut versions: Vec<(i64, InodeRaw)> = Vec::new();
+        for (id, t) in &summaries[from..] {
+            match self.staging.load_segment_header(*id, stream).await {
+                Ok(hdr) => versions.push((*t, hdr.s_inode)),
+                // Gone since the listing, or never a checkpoint: nothing to keep.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => {
+                    debug!("prune: {} has no readable summary ({}); not a version to keep", id, e);
+                },
+                Err(e) => return Err(e),
+            }
+        }
+        // The window: every version from the last one written before it.
+        let opened = versions.iter().filter(|(t, _)| *t < cutoff).map(|(t, _)| *t).max();
+        Ok(versions.into_iter()
+            .filter(|(t, _)| opened.is_none_or(|o| *t >= o))
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    /// `prune`, keeping what readers may still be reading; see [`PruneOptions`].
+    /// Returns the objects deleted, or with `dry_run` the objects it would delete.
+    pub async fn prune_with(&self, low: Cno, high: Cno, opts: &PruneOptions) -> Result<Vec<SegmentId>> {
+        let (_, unref) = self.collect_within(low, high, opts.grace).await?;
+        if opts.dry_run {
+            return Ok(unref);
+        }
+        let delete_keys = unref.iter()
+            .map(|segid| format!("{}/{}", self.root_path, Segment::segid_to_staging_file_id(*segid)))
+            .collect::<Vec<String>>();
+        debug!("unreferenced segments to delete: {:?}", delete_keys);
+        Self::do_delete_objects(&self.client, &self.bucket, delete_keys).await?;
+        Ok(unref)
+    }
+
+    /// Every object the map of `root` points into, read whole.
+    pub(crate) async fn reachable_objects(&self, view: &ContainerView, root: InodeRaw) -> Result<BTreeSet<SegmentId>> {
+        let loader = S3BlockLoader::new(
+            &self.client, &self.bucket, &self.root_path,
+            Arc::new(ReadTiming::default()),
+        );
+        let meta_block_size = view.meta_block_size;
+        let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<BlockPtr>> {
+            walk_roots(&loader, meta_block_size, &[root], BTreeSet::new())
+        });
+        let ptrs = match join.await {
+            Ok(inner) => inner?,
+            Err(join_err) => return Err(Error::other(format!("bmap walk task failed to join: {}", join_err))),
+        };
+        Ok(ptrs.iter().map(|p| view.object_of(p)).collect())
+    }
+
+    /// Every location the maps of `roots` reach that `view` did not: the nodes
+    /// under a pointer `view` already walked are the same nodes, since an object
+    /// is never changed once written, so only what differs is read.
+    async fn walk_more(&self, view: &ContainerView, roots: Vec<InodeRaw>) -> Result<BTreeSet<BlockPtr>> {
+        let roots: Vec<InodeRaw> = roots.into_iter()
+            .filter(|r| r.i_bmap != view.walked_root().i_bmap)
+            .collect();
+        if roots.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let loader = S3BlockLoader::new(
+            &self.client, &self.bucket, &self.root_path,
+            Arc::new(ReadTiming::default()),
+        );
+        let known = view.live.meta.clone();
+        let meta_block_size = view.meta_block_size;
+        let join = tokio::task::spawn_blocking(move || -> Result<BTreeSet<BlockPtr>> {
+            walk_roots(&loader, meta_block_size, &roots, known)
+        });
+        match join.await {
+            Ok(inner) => inner,
+            Err(join_err) => Err(Error::other(format!("bmap walk task failed to join: {}", join_err))),
+        }
+    }
+}
+
+/// Every location on staging reachable from the maps of `roots`, less the
+/// subtrees under node pointers in `known`. Driven on the calling thread, as
+/// [`S3Cleaner::walk_live_ptrs`] is.
+fn walk_roots(loader: &S3BlockLoader, meta_block_size: usize, roots: &[InodeRaw], mut known: BTreeSet<BlockPtr>)
+    -> Result<BTreeSet<BlockPtr>>
+{
+    use btree_ondisk::node::{BtreeNode, DirectNode, BTREE_NODE_LEVEL_MIN};
+    let handle = tokio::runtime::Handle::current();
+    let mut found = BTreeSet::new();
+    for root in roots {
+        let node = BtreeNode::<BlockIndex, BlockPtr, BlockPtr>::from_slice_ref(&root.i_bmap)?;
+        let ud = node.get_userdata();
+        // Child node pointers to read, level by level.
+        let mut frontier: Vec<BlockPtr> = Vec::new();
+        if !node.is_large() {
+            let direct = DirectNode::<BlockPtr>::from_slice_ref(&root.i_bmap)?;
+            for i in 0..direct.get_capacity() {
+                found.insert(*direct.get_val(i));
+            }
+        } else {
+            let leaf = node.get_level() == BTREE_NODE_LEVEL_MIN;
+            for i in 0..node.get_nchild() {
+                let v = *node.get_val::<BlockPtr>(i);
+                if leaf {
+                    found.insert(v);
+                } else if known.insert(v) {
+                    found.insert(v);
+                    frontier.push(v);
+                }
+            }
+        }
+        let mut side: std::collections::HashMap<BlockPtr, Vec<u8>> = std::collections::HashMap::new();
+        while !frontier.is_empty() {
+            let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(frontier.len());
+            let mut ask: Vec<BlockPtr> = Vec::new();
+            let mut have: Vec<(BlockPtr, Vec<u8>)> = Vec::new();
+            for p in frontier.drain(..) {
+                match side.remove(&p) {
+                    Some(b) => have.push((p, b)),
+                    None => { ask.push(p); bufs.push(vec![0u8; meta_block_size]); },
+                }
+            }
+            if !ask.is_empty() {
+                for (p, b) in handle.block_on(loader.read_batch(&ask, &mut bufs, ud))? {
+                    side.insert(p, b);
+                }
+                have.extend(ask.into_iter().zip(bufs));
+            }
+            for (_, bytes) in have {
+                let node = BtreeNode::<BlockIndex, BlockPtr, BlockPtr>::from_slice_ref(&bytes)?;
+                let leaf = node.get_level() == BTREE_NODE_LEVEL_MIN;
+                for i in 0..node.get_nchild() {
+                    let v = *node.get_val::<BlockPtr>(i);
+                    if leaf {
+                        found.insert(v);
+                    } else if known.insert(v) {
+                        found.insert(v);
+                        frontier.push(v);
+                    }
+                }
+            }
+        }
+    }
+    found.retain(BlockPtrFormat::is_on_staging);
+    Ok(found)
+}
+
+/// How [`S3Cleaner::prune_with`] decides what nothing reads any more.
+///
+/// [`Cleaner::prune`] takes everything the newest version does not point into,
+/// less what a compaction attached to it points into (and refuses, deleting
+/// nothing, where the inode says one is attached and its metadata does not
+/// read). A reader that opened an older version, or a plan made under one and
+/// fetched outside the handle, reads objects the newest version no longer points
+/// at, and a compaction beside the writer writes copies nothing points at until
+/// it attaches them. `grace` keeps both:
+///
+/// - every object that a version current at any time in the last `grace` points
+///   into: each checkpoint published in it, and the version current when it
+///   began;
+/// - every object written in the last `grace`.
+///
+/// So `grace` has to be longer than any reader holds a version, and a
+/// compaction's `max_age` shorter than `grace`. Times are the store's. Nothing
+/// above the newest published number is taken either way: the writer's next
+/// checkpoint is being written there.
+#[derive(Clone, Debug, Default)]
+pub struct PruneOptions {
+    /// How long a version is kept after it stops being the newest, and an object
+    /// after it is written. Zero is [`Cleaner::prune`].
+    pub grace: std::time::Duration,
+    /// Decide and report, delete nothing.
+    pub dry_run: bool,
 }
 
 /// Every live location of a container, and the metadata-node subset of it.
@@ -481,6 +716,8 @@ pub(crate) const DATA_WINDOW_BLOCKS: usize = 64 * 1024;
 pub(crate) struct ObjectListing {
     /// Segment objects and their sizes, ascending.
     pub(crate) objects: Vec<(SegmentId, u64)>,
+    /// When each was written, in seconds since the epoch, as the store reports.
+    pub(crate) modified: std::collections::BTreeMap<SegmentId, i64>,
     /// How many keys under the prefix were neither the inode nor a segment
     /// object. A WAL root nested under the container is the usual reason.
     pub(crate) foreign: usize,
@@ -491,6 +728,15 @@ pub(crate) struct ObjectListing {
 pub(crate) struct ContainerView {
     pub(crate) low: Cno,
     pub(crate) high_cno: Cno,
+    /// The inode as stored: the newest version, which readers open.
+    pub(crate) stored: InodeRaw,
+    /// Whether `live` is the stored inode's map. Not when an older `high` was
+    /// asked for, whose own map was walked instead.
+    pub(crate) walked_stored: bool,
+    /// The inode whose map was walked when it is not the stored one.
+    pub(crate) walked: InodeRaw,
+    /// What the stored inode object's metadata says of an attached compaction.
+    pub(crate) compaction: StoredCompaction,
     /// Whether the published inode marks its checkpoint as a compaction
     /// (`InodeRaw::FLAG_COMPACTED`): it moved blocks and changed no content.
     pub(crate) latest_compacted: bool,
@@ -503,6 +749,34 @@ pub(crate) struct ContainerView {
 }
 
 impl ContainerView {
+    /// The inode whose map `live` is.
+    /// The map of the compaction attached to the stored inode, as an inode to
+    /// walk, or `None` where none is. The attached-compaction bit without
+    /// metadata that reads is refused rather than guessed at: what the
+    /// compaction's copies are cannot then be known, and they may be all that
+    /// the writer's next publish reads through.
+    pub(crate) fn attached_root(&self) -> Result<Option<InodeRaw>> {
+        let root = |p: &PendingCompaction| {
+            let mut r = self.stored;
+            r.i_bmap = p.root;
+            r
+        };
+        match &self.compaction {
+            StoredCompaction::Pending(p) => Ok(Some(root(p))),
+            StoredCompaction::Unreadable(why) => Err(Error::new(ErrorKind::InvalidData, format!(
+                "the inode object's compaction metadata does not read ({}); refusing to judge what \
+                 an attached compaction reads through", why))),
+            StoredCompaction::None if self.stored.is_compaction_pending() => Err(Error::new(ErrorKind::InvalidData,
+                "the inode says a compaction is attached and its object has no compaction metadata; \
+                 refusing to judge what that compaction reads through")),
+            StoredCompaction::None => Ok(None),
+        }
+    }
+
+    pub(crate) fn walked_root(&self) -> &InodeRaw {
+        if self.walked_stored { &self.stored } else { &self.walked }
+    }
+
     pub(crate) fn object_ids(&self) -> Vec<SegmentId> {
         self.listing.objects.iter().map(|(segid, _)| *segid).collect()
     }
